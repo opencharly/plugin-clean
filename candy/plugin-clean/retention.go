@@ -38,29 +38,61 @@ import (
 // resolution stays with whoever can load the project — core call sites resolve in-process,
 // the plugin's own CLI + plugin-check's post-run hook + plugin-box's post-build prune resolve
 // it PLUGIN-SIDE via the shared sdk/loaderkit.ResolveRetentionDefaultsViaExecutor, K-wave 2
-// cone R6, the former "retention-defaults" HostBuild seam DELETED).
+// cone R6, the former "retention-defaults" HostBuild seam DELETED). It returns ONLY the wire
+// reply — a live-build skip signal is dropped here, because the shared wire type cannot carry it;
+// in-process callers that can REPORT a skip use runRetentionOutcome.
 func runRetention(req spec.RetentionRequest) spec.RetentionReply {
+	return runRetentionOutcome(req).Reply
+}
+
+// retentionOutcome is what ONE engine run decided: the WIRE reply PLUS the live-build skip
+// signals, one per guarded sweep. spec.RetentionReply is the CUE-generated SHARED wire type and
+// has no field for "a guarded sweep declined", so the signals travel BESIDE it here: the
+// plugin's own CLI (command.go) prints them, and runRetention — the verb:retention entry point
+// peer plugins call — drops them. Carrying them across the wire to those peer callers (plugin-box's
+// post-build prune, plugin-check's post-run prune) needs a new field on the shared
+// #RetentionReply schema in opencharly/spec plus a pin bump: a cross-repo change, deliberately
+// not guessed at here.
+type retentionOutcome struct {
+	Reply spec.RetentionReply
+
+	// DanglingSkip is set when the charly-labeled dangling sweep (the `images` category)
+	// declined on the live-build guard, never when it merely found nothing.
+	DanglingSkip *retentionSkip
+
+	// StagingSkip is set when the buildah/podman staging sweep (the `images` category)
+	// declined on the same guard.
+	StagingSkip *retentionSkip
+
+	// DeepSkip is set when the store-wide dangling sweep (the `deep` category) declined.
+	DeepSkip *retentionSkip
+}
+
+// runRetentionOutcome runs the requested category(ies) and returns the wire reply plus the
+// live-build skip signal(s) — the form every caller that can REPORT a skip (the plugin's own CLI)
+// uses, so the guard's decision is made once, in the engine, and never re-derived by a caller.
+func runRetentionOutcome(req spec.RetentionRequest) retentionOutcome {
 	engineBin, err := resolveEngineBinary()
 	if err != nil {
-		return spec.RetentionReply{Error: err.Error()}
+		return retentionOutcome{Reply: spec.RetentionReply{Error: err.Error()}}
 	}
 
 	// --invalidate: targeted image-tag invalidation ONLY (matches the CLI's early return).
 	if req.Invalidate != "" {
 		refs, ierr := invalidateImageTags(engineBin, req.Invalidate, req.DryRun)
 		if ierr != nil {
-			return spec.RetentionReply{Error: fmt.Sprintf("invalidating image tags: %v", ierr)}
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("invalidating image tags: %v", ierr)}}
 		}
-		return spec.RetentionReply{ImageRefs: refs}
+		return retentionOutcome{Reply: spec.RetentionReply{ImageRefs: refs}}
 	}
 
 	// list: the read-only tag inventory (`charly box list tags`) — nothing removed.
 	if req.List {
 		groups, lerr := charlyImageTags(engineBin)
 		if lerr != nil {
-			return spec.RetentionReply{Error: fmt.Sprintf("listing image tags: %v", lerr)}
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("listing image tags: %v", lerr)}}
 		}
-		return spec.RetentionReply{TagGroups: flattenTagGroups(groups)}
+		return retentionOutcome{Reply: spec.RetentionReply{TagGroups: flattenTagGroups(groups)}}
 	}
 
 	keepImages, keepCheck := req.KeepImages, req.KeepCheckRuns
@@ -75,45 +107,50 @@ func runRetention(req spec.RetentionRequest) spec.RetentionReply {
 		reply := spec.RetentionReply{KeepImages: keepImages}
 		refs, perr := pruneImagesByRetention(engineBin, keepImages, req.DryRun)
 		if perr != nil {
-			return spec.RetentionReply{Error: fmt.Sprintf("pruning images: %v", perr)}
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("pruning images: %v", perr)}}
 		}
 		reply.ImageRefs = refs
 		reply.BuildDirs = pruneBuildCandyDirs(filepath.Join(req.Dir, ".build"), keepImages, req.DryRun)
-		return reply
+		return retentionOutcome{Reply: reply}
 	}
 
-	reply := spec.RetentionReply{KeepImages: keepImages, KeepCheckRuns: keepCheck}
+	out := retentionOutcome{Reply: spec.RetentionReply{KeepImages: keepImages, KeepCheckRuns: keepCheck}}
+	reply := &out.Reply
 
 	if req.Images {
 		refs, perr := pruneImagesByRetention(engineBin, keepImages, req.DryRun)
 		if perr != nil {
-			return spec.RetentionReply{Error: fmt.Sprintf("pruning images: %v", perr)}
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("pruning images: %v", perr)}}
 		}
 		reply.ImageRefs = refs
-		dangling, derr := pruneDanglingCharlyImages(engineBin, req.DryRun)
+		dangling, skip, derr := pruneDanglingCharlyImages(engineBin, req.DryRun)
 		if derr != nil {
-			return spec.RetentionReply{Error: fmt.Sprintf("pruning dangling images: %v", derr)}
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("pruning dangling images: %v", derr)}}
 		}
 		reply.DanglingIDs = dangling
-		reply.StagingDirs = pruneBuildahStaging(req.DryRun)
+		out.DanglingSkip = skip
+		staging, sskip := pruneBuildahStaging(req.DryRun)
+		reply.StagingDirs = staging
+		out.StagingSkip = sskip
 		reply.BuildDirs = pruneBuildCandyDirs(filepath.Join(req.Dir, ".build"), keepImages, req.DryRun)
 	}
 	if req.Check {
 		paths, perr := pruneCheckRuns(filepath.Join(req.Dir, ".check"), keepCheck, req.DryRun)
 		if perr != nil {
-			return spec.RetentionReply{Error: fmt.Sprintf("pruning check runs: %v", perr)}
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("pruning check runs: %v", perr)}}
 		}
 		reply.CheckPaths = paths
 	}
 	if req.Deep {
-		ids, bytes, derr := pruneDeepDanglingImages(engineBin, req.DryRun)
+		ids, bytes, skip, derr := pruneDeepDanglingImages(engineBin, req.DryRun)
 		if derr != nil {
-			return spec.RetentionReply{Error: fmt.Sprintf("deep-purging dangling images: %v", derr)}
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("deep-purging dangling images: %v", derr)}}
 		}
 		reply.DeepIDs = ids
 		reply.DeepBytes = bytes
+		out.DeepSkip = skip
 	}
-	return reply
+	return out
 }
 
 // resolveEngineBinary resolves the container engine binary via kit.ResolveRuntime — the
@@ -300,6 +337,38 @@ func flattenTagGroups(groups map[string][]imageTagInfo) []spec.TagInfo {
 // (no-live-build) result so the retention decision under test is deterministic
 // regardless of host build activity.
 var liveBuildFloor = defaultLiveBuildFloor
+
+// The live-build guard's two reasons, one per guarded sweep family — kept as constants so the
+// CLI, the tests, and the engine all name the SAME cause text.
+const (
+	// skipReasonImages: image-removing sweeps (dangling-image reaper, charly-labeled and
+	// store-wide).
+	skipReasonImages = "images are never removed during a build"
+	// skipReasonStaging: the /var/tmp buildah-podman staging reaper (an in-flight build's
+	// staging dir is LIVE data, not dead weight).
+	skipReasonStaging = "buildah/podman staging of an in-flight build is never swept"
+)
+
+// retentionSkip is a live-build-guarded sweep's DECISION TO DECLINE, carried OUT of the engine so
+// a caller — and the operator reading its output — can tell "the guard stopped me" apart from
+// "there was nothing to remove". Both cases return the same empty id list; only this signal
+// distinguishes them, and conflating them is exactly how `deep: removed 0 untagged image(s)
+// store-wide` was read as "the tool is blind" while 63 removable untagged images (tens of GB)
+// sat in the store — an operator then reached for raw `podman rmi -f`, which deletes the very
+// build-layer cache that makes the next build ~8x faster.
+//
+// The guard's WHEN is unchanged and deliberately so (an untagged intermediate may be the parent
+// of an in-flight build); this type only makes its decision observable.
+type retentionSkip struct {
+	live   int
+	reason string
+}
+
+// String is the user-visible form: the exact line the CLI prints IN PLACE OF the removed count
+// for the skipped category.
+func (s retentionSkip) String() string {
+	return fmt.Sprintf("SKIPPED — %d build(s) in flight; %s (re-run when builds are idle)", s.live, s.reason)
+}
 
 // defaultLiveBuildFloor scans the build-activity locks (kit.BuildActivityDir): a
 // lock file whose flock is ACQUIRABLE is stale (its build died) and is reaped;
@@ -555,18 +624,21 @@ func selectDanglingImages(imgs []kit.LocalImageInfo, onlyCharly bool) []kit.Loca
 // by a container or held by an in-flight build is refused and silently skipped (the same
 // backstop tag retention relies on). Guarded like every other image-removing sweep in this file:
 // never while ANY build is live (an untagged intermediate may be a parent of an in-flight
-// build). Returns the removed (or would-remove, under dryRun) image IDs and the sum of their
-// reported Size in bytes. This byte total is an UPPER BOUND on actual reclaimed disk, NOT a
-// prediction: podman's per-image Size counts every layer the image references, and dangling
-// images routinely SHARE layers with images that stay (retained tags, other dangling images) —
-// removing one image frees only the layers it held UNIQUELY.
-func pruneDanglingImages(engine string, onlyCharly, dryRun bool) ([]string, int64, error) {
+// build) — and when that guard fires it returns a retentionSkip naming the in-flight build
+// count, so the caller can report the DECLINE instead of printing an empty result that reads
+// like an empty store. Returns the removed (or would-remove, under dryRun) image IDs, the sum of
+// their reported Size in bytes, and the skip signal (nil unless the live-build guard declined).
+// This byte total is an UPPER BOUND on actual reclaimed disk, NOT a prediction: podman's
+// per-image Size counts every layer the image references, and dangling images routinely SHARE
+// layers with images that stay (retained tags, other dangling images) — removing one image frees
+// only the layers it held UNIQUELY.
+func pruneDanglingImages(engine string, onlyCharly, dryRun bool) ([]string, int64, *retentionSkip, error) {
 	if _, _, live := liveBuildFloor(); live > 0 {
-		return nil, 0, nil // never delete images while any build is in flight
+		return nil, 0, &retentionSkip{live: live, reason: skipReasonImages}, nil // never delete images while any build is in flight
 	}
 	imgs, err := listDanglingImages(engine)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	var removed []string
 	var totalBytes int64
@@ -582,16 +654,16 @@ func pruneDanglingImages(engine string, onlyCharly, dryRun bool) ([]string, int6
 		removed = append(removed, im.ID)
 		totalBytes += im.Size
 	}
-	return removed, totalBytes, nil
+	return removed, totalBytes, nil, nil
 }
 
 // pruneDanglingCharlyImages removes UNTAGGED (dangling) charly-built images — the residue
 // tag-retention leaves behind (an untagged id) plus dead build intermediates that happen to
 // carry the ai.opencharly.box label. The default `charly clean` category; see
-// pruneDanglingImages for the shared engine.
-func pruneDanglingCharlyImages(engine string, dryRun bool) ([]string, error) {
-	ids, _, err := pruneDanglingImages(engine, true, dryRun)
-	return ids, err
+// pruneDanglingImages for the shared engine and the skip signal.
+func pruneDanglingCharlyImages(engine string, dryRun bool) ([]string, *retentionSkip, error) {
+	ids, _, skip, err := pruneDanglingImages(engine, true, dryRun)
+	return ids, skip, err
 }
 
 // pruneDeepDanglingImages removes EVERY untagged (dangling) image in local storage — the
@@ -599,7 +671,7 @@ func pruneDanglingCharlyImages(engine string, dryRun bool) ([]string, error) {
 // restricted to the ai.opencharly.box label. Removing a dangling image via `rmi` also frees
 // any layer blobs it alone referenced, so this is EFFECTIVELY a dangling-image-plus-unused-
 // layer prune with a single engine call per image, not two.
-func pruneDeepDanglingImages(engine string, dryRun bool) ([]string, int64, error) {
+func pruneDeepDanglingImages(engine string, dryRun bool) ([]string, int64, *retentionSkip, error) {
 	return pruneDanglingImages(engine, false, dryRun)
 }
 
@@ -613,10 +685,11 @@ var buildahStagingGlobs = []string{
 }
 
 // pruneBuildahStaging removes dead buildah/podman staging dirs (see
-// buildahStagingGlobs). Live-build-guarded like the dangling reaper.
-func pruneBuildahStaging(dryRun bool) []string {
+// buildahStagingGlobs). Live-build-guarded like the dangling reaper, and like it the guard's
+// decision is returned as a retentionSkip (nil = the sweep ran).
+func pruneBuildahStaging(dryRun bool) ([]string, *retentionSkip) {
 	if _, _, live := liveBuildFloor(); live > 0 {
-		return nil
+		return nil, &retentionSkip{live: live, reason: skipReasonStaging}
 	}
 	uid := os.Getuid()
 	var removed []string
@@ -640,7 +713,7 @@ func pruneBuildahStaging(dryRun bool) []string {
 			removed = append(removed, m)
 		}
 	}
-	return removed
+	return removed, nil
 }
 
 // --- check-run + build-candy staging retention ----------------------------------------------
