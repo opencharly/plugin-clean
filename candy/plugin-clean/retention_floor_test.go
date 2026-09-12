@@ -130,3 +130,61 @@ func TestRetentionRemovable(t *testing.T) {
 		}
 	}
 }
+
+// TestPruneDanglingImages_LiveBuildReportsSkip pins the OBSERVABLE half of the live-build guard:
+// the sweep still removes NOTHING (the safety property, deliberately unchanged), but it now says
+// it DECLINED — naming the in-flight build count — instead of returning the same empty result a
+// genuinely empty store produces. listDanglingImages is stubbed to fail the test if it is ever
+// called: the guard must still short-circuit BEFORE listing.
+func TestPruneDanglingImages_LiveBuildReportsSkip(t *testing.T) {
+	origList, origFloor := listDanglingImages, liveBuildFloor
+	defer func() { listDanglingImages, liveBuildFloor = origList, origFloor }()
+	liveBuildFloor = func() (kit.CalVer, bool, int) {
+		return kit.CalVer{Year: 2026, Day: 188, HHMM: 1900}, true, 2
+	}
+	listDanglingImages = func(string) ([]kit.LocalImageInfo, error) {
+		t.Fatal("listDanglingImages must not be called while a build is live")
+		return nil, nil
+	}
+
+	const wantLine = "SKIPPED — 2 build(s) in flight; images are never removed during a build (re-run when builds are idle)"
+	for _, onlyCharly := range []bool{true, false} {
+		ids, totalBytes, skip, err := pruneDanglingImages("podman", onlyCharly, true)
+		if err != nil {
+			t.Fatalf("onlyCharly=%v: prune: %v", onlyCharly, err)
+		}
+		if ids != nil || totalBytes != 0 {
+			t.Errorf("onlyCharly=%v: live-build guard must remove nothing, got (%v, %d)", onlyCharly, ids, totalBytes)
+		}
+		if skip == nil {
+			t.Fatalf("onlyCharly=%v: want a skip signal — an empty result alone is indistinguishable from an empty store", onlyCharly)
+		}
+		if skip.live != 2 {
+			t.Errorf("onlyCharly=%v: skip.live = %d, want 2", onlyCharly, skip.live)
+		}
+		if got := skip.String(); got != wantLine {
+			t.Errorf("onlyCharly=%v: skip line\n got: %s\nwant: %s", onlyCharly, got, wantLine)
+		}
+	}
+}
+
+// TestPruneBuildahStaging_LiveBuildReportsSkip is the same contract for the THIRD guarded sweep
+// (the /var/tmp buildah staging reaper): nothing is swept while a build is live, and the caller is
+// told why instead of receiving the same empty list a clean host yields.
+func TestPruneBuildahStaging_LiveBuildReportsSkip(t *testing.T) {
+	origFloor := liveBuildFloor
+	defer func() { liveBuildFloor = origFloor }()
+	liveBuildFloor = func() (kit.CalVer, bool, int) { return kit.CalVer{}, false, 3 }
+
+	dirs, skip := pruneBuildahStaging(true)
+	if dirs != nil {
+		t.Errorf("live-build guard must sweep nothing, got %v", dirs)
+	}
+	if skip == nil || skip.live != 3 {
+		t.Fatalf("want a skip naming live=3, got %v", skip)
+	}
+	const wantLine = "SKIPPED — 3 build(s) in flight; buildah/podman staging of an in-flight build is never swept (re-run when builds are idle)"
+	if got := skip.String(); got != wantLine {
+		t.Errorf("skip line\n got: %s\nwant: %s", got, wantLine)
+	}
+}

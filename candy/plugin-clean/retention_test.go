@@ -295,9 +295,12 @@ func TestPruneDanglingImages_Deep_DryRun(t *testing.T) {
 		}, nil
 	}
 
-	ids, totalBytes, err := pruneDanglingImages("podman", false, true)
+	ids, totalBytes, skip, err := pruneDanglingImages("podman", false, true)
 	if err != nil {
 		t.Fatalf("prune: %v", err)
+	}
+	if skip != nil {
+		t.Errorf("no live build: skip = %v, want nil", skip)
 	}
 	if len(ids) != 2 {
 		t.Fatalf("deep dry-run: removed %d ids, want 2: %v", len(ids), ids)
@@ -321,9 +324,12 @@ func TestPruneDanglingImages_CharlyOnly_DryRun(t *testing.T) {
 		}, nil
 	}
 
-	ids, totalBytes, err := pruneDanglingImages("podman", true, true)
+	ids, totalBytes, skip, err := pruneDanglingImages("podman", true, true)
 	if err != nil {
 		t.Fatalf("prune: %v", err)
+	}
+	if skip != nil {
+		t.Errorf("no live build: skip = %v, want nil", skip)
 	}
 	if len(ids) != 1 || ids[0] != "aaa" {
 		t.Fatalf("charly-only dry-run: ids = %v, want [aaa]", ids)
@@ -333,18 +339,24 @@ func TestPruneDanglingImages_CharlyOnly_DryRun(t *testing.T) {
 	}
 
 	// pruneDanglingCharlyImages wraps the same shared engine with onlyCharly=true, dropping bytes.
-	wrapped, werr := pruneDanglingCharlyImages("podman", true)
+	wrapped, wskip, werr := pruneDanglingCharlyImages("podman", true)
 	if werr != nil {
 		t.Fatalf("pruneDanglingCharlyImages: %v", werr)
+	}
+	if wskip != nil {
+		t.Errorf("pruneDanglingCharlyImages: skip = %v, want nil", wskip)
 	}
 	if len(wrapped) != 1 || wrapped[0] != "aaa" {
 		t.Fatalf("pruneDanglingCharlyImages: ids = %v, want [aaa]", wrapped)
 	}
 
 	// pruneDeepDanglingImages wraps the same shared engine with onlyCharly=false.
-	deepIDs, deepBytes, derr := pruneDeepDanglingImages("podman", true)
+	deepIDs, deepBytes, deepSkip, derr := pruneDeepDanglingImages("podman", true)
 	if derr != nil {
 		t.Fatalf("pruneDeepDanglingImages: %v", derr)
+	}
+	if deepSkip != nil {
+		t.Errorf("pruneDeepDanglingImages: skip = %v, want nil", deepSkip)
 	}
 	if len(deepIDs) != 2 {
 		t.Fatalf("pruneDeepDanglingImages: ids = %v, want 2 (both aaa and bbb)", deepIDs)
@@ -389,12 +401,17 @@ func TestPruneDeepDanglingImages_LiveBuildGuard(t *testing.T) {
 		return nil, nil
 	}
 
-	ids, totalBytes, err := pruneDeepDanglingImages("podman", true)
+	ids, totalBytes, skip, err := pruneDeepDanglingImages("podman", true)
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
 	if ids != nil || totalBytes != 0 {
 		t.Errorf("live-build guard: got (%v, %d), want (nil, 0)", ids, totalBytes)
+	}
+	// The guard's DECISION must be observable, not just its effect: the caller has to be
+	// able to tell "declined" from "found nothing" (the whole point of the skip signal).
+	if skip == nil || skip.live != 1 {
+		t.Errorf("live-build guard: skip = %v, want a skip naming live=1", skip)
 	}
 }
 

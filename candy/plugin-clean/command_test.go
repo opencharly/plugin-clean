@@ -1,7 +1,11 @@
 package clean
 
 import (
+	"bytes"
+	"strings"
 	"testing"
+
+	"github.com/opencharly/spec/spec"
 )
 
 // TestCleanCategories covers the --images/--check/--deep flag-resolution logic: the pre-existing
@@ -50,4 +54,100 @@ func TestCleanCategories(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPrintRetentionResult_SkipIsExplicit is the OPERATOR-FACING half of the fix: when a
+// live-build-guarded sweep declines, the CLI prints the engine's SKIP line — naming the cause and
+// the in-flight build count — IN PLACE OF the removed count, so "0 removed" can never again be
+// read as "nothing to remove". The fixture replies deliberately carry NON-EMPTY ids: a skip that
+// still printed them would be exactly the ambiguity this closes.
+func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
+	skipImages := &retentionSkip{live: 2, reason: skipReasonImages}
+	skipStaging := &retentionSkip{live: 2, reason: skipReasonStaging}
+	const (
+		wantDeepSkip     = "deep: SKIPPED — 2 build(s) in flight; images are never removed during a build (re-run when builds are idle)\n"
+		wantDanglingSkip = "dangling: SKIPPED — 2 build(s) in flight; images are never removed during a build (re-run when builds are idle)\n"
+		wantStagingSkip  = "staging: SKIPPED — 2 build(s) in flight; buildah/podman staging of an in-flight build is never swept (re-run when builds are idle)\n"
+	)
+
+	t.Run("--deep", func(t *testing.T) {
+		var buf bytes.Buffer
+		out := retentionOutcome{
+			Reply:    spec.RetentionReply{DeepIDs: []string{"sha256:aaaa"}, DeepBytes: 45 << 30},
+			DeepSkip: skipImages,
+		}
+		if err := printRetentionResult(&buf, "removed", false, false, true, out); err != nil {
+			t.Fatalf("print: %v", err)
+		}
+		if got := buf.String(); got != wantDeepSkip {
+			t.Errorf("--deep skip output\n got: %q\nwant: %q", got, wantDeepSkip)
+		}
+	})
+
+	t.Run("--images", func(t *testing.T) {
+		var buf bytes.Buffer
+		out := retentionOutcome{
+			Reply: spec.RetentionReply{
+				KeepImages:  3,
+				DanglingIDs: []string{"sha256:bbbb"},
+				StagingDirs: []string{"/var/tmp/buildah-x"},
+			},
+			DanglingSkip: skipImages,
+			StagingSkip:  skipStaging,
+		}
+		if err := printRetentionResult(&buf, "removed", true, false, false, out); err != nil {
+			t.Fatalf("print: %v", err)
+		}
+		want := "images: removed 0 tag(s) (keep_images=3)\n" + wantDanglingSkip + wantStagingSkip +
+			"build: removed 0 staging dir(s) under .build/_candy (keep_images=3)\n"
+		if got := buf.String(); got != want {
+			t.Errorf("--images skip output\n got: %q\nwant: %q", got, want)
+		}
+	})
+
+	t.Run("no live build: counts, never a skip line", func(t *testing.T) {
+		var buf bytes.Buffer
+		out := retentionOutcome{Reply: spec.RetentionReply{
+			KeepImages:  3,
+			DanglingIDs: []string{"sha256:bbbb"},
+			StagingDirs: []string{"/var/tmp/buildah-x"},
+			DeepIDs:     []string{"sha256:aaaa", "sha256:cccc"},
+			DeepBytes:   45 << 30,
+		}}
+		if err := printRetentionResult(&buf, "removed", true, false, true, out); err != nil {
+			t.Fatalf("print: %v", err)
+		}
+		got := buf.String()
+		if strings.Contains(got, "SKIPPED") {
+			t.Errorf("the engine reported no skip, yet the output claims one:\n%s", got)
+		}
+		for _, want := range []string{
+			"images: removed 0 tag(s) (keep_images=3)\n",
+			"dangling: removed 1 untagged charly image(s)\n  sha256:bbbb\n",
+			"staging: removed 1 dead buildah staging dir(s)\n  /var/tmp/buildah-x\n",
+			"deep: removed 2 untagged image(s) store-wide (up to ",
+			"  sha256:aaaa\n  sha256:cccc\n",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output missing %q:\n%s", want, got)
+			}
+		}
+	})
+
+	// The staging line used to be omitted whenever it found nothing, which hid BOTH "nothing to
+	// sweep" and "the sweep declined". It is now printed unconditionally, like `dangling`.
+	t.Run("empty staging is still reported", func(t *testing.T) {
+		var buf bytes.Buffer
+		out := retentionOutcome{Reply: spec.RetentionReply{KeepImages: 3}}
+		if err := printRetentionResult(&buf, "removed", true, false, false, out); err != nil {
+			t.Fatalf("print: %v", err)
+		}
+		want := "images: removed 0 tag(s) (keep_images=3)\n" +
+			"dangling: removed 0 untagged charly image(s)\n" +
+			"staging: removed 0 dead buildah staging dir(s)\n" +
+			"build: removed 0 staging dir(s) under .build/_candy (keep_images=3)\n"
+		if got := buf.String(); got != want {
+			t.Errorf("output\n got: %q\nwant: %q", got, want)
+		}
+	})
 }
