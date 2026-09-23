@@ -26,6 +26,7 @@ import (
 	"syscall"
 
 	"github.com/opencharly/sdk/kit"
+	"github.com/opencharly/spec/cache"
 	"github.com/opencharly/spec/spec"
 )
 
@@ -150,7 +151,45 @@ func runRetentionOutcome(req spec.RetentionRequest) retentionOutcome {
 		reply.DeepBytes = bytes
 		out.DeepSkip = skip
 	}
+	if req.Cache {
+		stores, cerr := gcCacheStores(req.DryRun)
+		if cerr != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("GCing the cache stores: %v", cerr)}}
+		}
+		reply.CacheStores = stores
+	}
 	return out
+}
+
+// gcCacheStores reclaims unreferenced blobs from EVERY named `spec/cache`
+// ArtifactStore under the cache root (the `cache` category, `charly clean
+// --cache`). A replaced/deleted ArtifactStore entry leaves its superseded blobs
+// behind (content addressing means a new key is a NEW manifest + blobs); each
+// store's own GC reclaims them, bounded to its own entry cap. No live-build
+// guard is needed here — this touches only the CAS blob store, never the podman
+// image store the guard protects. An empty/absent cache root is an empty list,
+// never an error. Read-only under dry_run (GCStats computes the same set without
+// removing).
+func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
+	names, err := cache.NamedStores()
+	if err != nil {
+		return nil, err
+	}
+	var out []spec.CacheStoreInfo
+	for _, name := range names {
+		l := cache.OpenNamedLayout(name)
+		reclaim, gerr := l.GCStats(dryRun)
+		if gerr != nil {
+			return nil, fmt.Errorf("store %q: %w", name, gerr)
+		}
+		out = append(out, spec.CacheStoreInfo{
+			Name:         name,
+			Entries:      int64(l.Len()),
+			RemovedBlobs: int64(reclaim.RemovedBlobs),
+			RemovedBytes: reclaim.RemovedBytes,
+		})
+	}
+	return out, nil
 }
 
 // resolveEngineBinary resolves the container engine binary via kit.ResolveRuntime — the

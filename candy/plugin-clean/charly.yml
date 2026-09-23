@@ -5,7 +5,7 @@ plugin-clean:
         description: |-
             COMPILED-IN charly COMMAND-class plugin that OWNS the externalized `charly clean`
             CLI — the build-artifact retention/prune surface. The plugin owns the command end to
-            end: the flag grammar (--dry-run / --images / --check / --deep / --keep / --invalidate),
+            end: the flag grammar (--dry-run / --images / --check / --deep / --cache / --keep / --invalidate),
             the category orchestration, and the report output. No plugin-specific command LOGIC is
             left in core.
 
@@ -83,9 +83,10 @@ plugin-clean:
             plugin_input (verb:retention's params are the internal spec.RetentionRequest RPC, never
             an authored plan step; command:clean's args are plain CLI tokens). The R10 witness is
             the disposable check-commands-local bed: `charly clean --dry-run` AND `charly clean
-            --deep --dry-run` both exit 0 and print their would-remove reports, proving the
-            externalized command + the local retention engine + the loader-resolved
-            retention-defaults end-to-end for both the charly-labeled and the store-wide sweep.
+            --deep --dry-run` AND `charly clean --cache --dry-run` both exit 0 and print their
+            would-remove reports, proving the externalized command + the local retention engine +
+            the loader-resolved retention-defaults end-to-end for the charly-labeled sweep, the
+            store-wide sweep, and the CAS ArtifactStore GC.
         plugin:
             source: github.com/opencharly/plugin-clean/candy/plugin-clean
             providers:
@@ -100,8 +101,13 @@ plugin-clean:
               # retention-defaults: `charly clean --dry-run` / `charly clean
               # --deep --dry-run` → exit 0 with the would-remove report — is exercised by the live
               # R10 bed (check-commands-local).
-              check: the clean command plugin ships a buildable Go module (go.mod + the provider package) compiled into charly; the full `charly clean` end-to-end, INCLUDING --deep (the local retention engine + the plugin-side loader-resolved retention-defaults), is exercised by the live R10 (check-commands-local)
+              check: the clean command plugin ships a buildable Go module (go.mod + the provider package) compiled into charly; the full `charly clean` end-to-end, INCLUDING --deep and --cache (the local retention engine + the plugin-side loader-resolved retention-defaults + the CAS ArtifactStore GC), is exercised by the live R10 (check-commands-local)
               id: clean-module-present
               context:
                 - build
               command: "true"
+            - check: the retention engine ships the `cache` category (the CAS ArtifactStore GC)
+              id: clean-cache-category-present
+              context:
+                - build
+              command: "grep -q 'gcCacheStores' retention.go && grep -q 'opencharly/spec/cache' retention.go"

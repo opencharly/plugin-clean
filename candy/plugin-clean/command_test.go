@@ -15,8 +15,9 @@ import (
 func TestCleanCategories(t *testing.T) {
 	cases := []struct {
 		name                            string
-		images, check, deep             bool
+		images, check, deep, cacheGC    bool
 		wantImages, wantCheck, wantDeep bool
+		wantCache                       bool
 	}{
 		{name: "no flags: full default sweep, deep excluded",
 			images: false, check: false, deep: false,
@@ -42,15 +43,21 @@ func TestCleanCategories(t *testing.T) {
 		{name: "all three flags: all categories",
 			images: true, check: true, deep: true,
 			wantImages: true, wantCheck: true, wantDeep: true},
+		{name: "--cache alone: only cache (never images/check)",
+			images: false, check: false, deep: false, cacheGC: true,
+			wantImages: false, wantCheck: false, wantDeep: false, wantCache: true},
+		{name: "--cache + --images: both, check excluded",
+			images: true, check: false, deep: false, cacheGC: true,
+			wantImages: true, wantCheck: false, wantDeep: false, wantCache: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotImages, gotCheck, gotDeep := cleanCategories(c.images, c.check, c.deep)
-			if gotImages != c.wantImages || gotCheck != c.wantCheck || gotDeep != c.wantDeep {
-				t.Errorf("cleanCategories(%v,%v,%v) = (%v,%v,%v), want (%v,%v,%v)",
-					c.images, c.check, c.deep,
-					gotImages, gotCheck, gotDeep,
-					c.wantImages, c.wantCheck, c.wantDeep)
+			gotImages, gotCheck, gotDeep, gotCache := cleanCategories(c.images, c.check, c.deep, c.cacheGC)
+			if gotImages != c.wantImages || gotCheck != c.wantCheck || gotDeep != c.wantDeep || gotCache != c.wantCache {
+				t.Errorf("cleanCategories(%v,%v,%v,%v) = (%v,%v,%v,%v), want (%v,%v,%v,%v)",
+					c.images, c.check, c.deep, c.cacheGC,
+					gotImages, gotCheck, gotDeep, gotCache,
+					c.wantImages, c.wantCheck, c.wantDeep, c.wantCache)
 			}
 		})
 	}
@@ -76,7 +83,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			Reply:    spec.RetentionReply{DeepIDs: []string{"sha256:aaaa"}, DeepBytes: 45 << 30},
 			DeepSkip: skipImages,
 		}
-		if err := printRetentionResult(&buf, "removed", false, false, true, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", false, false, true, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		if got := buf.String(); got != wantDeepSkip {
@@ -95,7 +102,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			DanglingSkip: skipImages,
 			StagingSkip:  skipStaging,
 		}
-		if err := printRetentionResult(&buf, "removed", true, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", true, false, false, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		want := "images: removed 0 tag(s) (keep_images=3)\n" + wantDanglingSkip + wantStagingSkip +
@@ -114,7 +121,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			DeepIDs:     []string{"sha256:aaaa", "sha256:cccc"},
 			DeepBytes:   45 << 30,
 		}}
-		if err := printRetentionResult(&buf, "removed", true, false, true, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", true, false, true, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := buf.String()
@@ -139,7 +146,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 	t.Run("empty staging is still reported", func(t *testing.T) {
 		var buf bytes.Buffer
 		out := retentionOutcome{Reply: spec.RetentionReply{KeepImages: 3}}
-		if err := printRetentionResult(&buf, "removed", true, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", true, false, false, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		want := "images: removed 0 tag(s) (keep_images=3)\n" +
@@ -148,6 +155,43 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			"build: removed 0 staging dir(s) under .build/_candy (keep_images=3)\n"
 		if got := buf.String(); got != want {
 			t.Errorf("output\n got: %q\nwant: %q", got, want)
+		}
+	})
+}
+
+// TestPrintRetentionResult_CacheCategory pins the `--cache` report shape: one
+// line per named store carrying its live entry count and the reclaimed
+// blob/byte figures, and an explicit "no named cache stores" line when the root
+// holds none (never a silent blank).
+func TestPrintRetentionResult_CacheCategory(t *testing.T) {
+	t.Run("named stores", func(t *testing.T) {
+		var buf bytes.Buffer
+		out := retentionOutcome{Reply: spec.RetentionReply{CacheStores: []spec.CacheStoreInfo{
+			{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20},
+			{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0},
+		}}}
+		if err := printRetentionResult(&buf, "removed", false, false, false, true, out); err != nil {
+			t.Fatalf("print: %v", err)
+		}
+		got := buf.String()
+		for _, want := range []string{
+			"cache project: 7 live entry(ies); removed 3 unreferenced blob(s)",
+			"cache materialized: 2 live entry(ies); removed 0 unreferenced blob(s)",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output missing %q:\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("no stores", func(t *testing.T) {
+		var buf bytes.Buffer
+		out := retentionOutcome{Reply: spec.RetentionReply{}}
+		if err := printRetentionResult(&buf, "would remove", false, false, false, true, out); err != nil {
+			t.Fatalf("print: %v", err)
+		}
+		if want := "cache: no named cache stores found\n"; buf.String() != want {
+			t.Errorf("got %q, want %q", buf.String(), want)
 		}
 	})
 }

@@ -39,6 +39,7 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 	images := fs.Bool("images", false, "Only image-tag retention")
 	check := fs.Bool("check", false, "Only check-run retention")
 	deep := fs.Bool("deep", false, "Purge every untagged/dangling image in local storage (not just charly-labeled) plus any layer blobs they alone held — reports UP TO the summed image size, since layers SHARED with kept images reduce actual reclaim; pair with --invalidate for the fullest reclaim. Runs ONLY this category unless combined with --images/--check")
+	cacheGC := fs.Bool("cache", false, "Reclaim unreferenced blobs from every named charly cache (the content-addressed ArtifactStore's own GC); reports each store's live entries + reclaimed blobs/bytes. Runs ONLY this category unless combined with --images/--check/--deep")
 	keep := fs.Int("keep", 0, "Override the retention count for this run (0 = use defaults:)")
 	invalidate := fs.String("invalidate", "", "Remove every charly-labeled image tag matching this glob (full ref or last path segment); runs ONLY the invalidation")
 	if err := fs.Parse(args); err != nil {
@@ -66,21 +67,29 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 		return nil
 	}
 
-	doImages, doCheck, doDeep := cleanCategories(*images, *check, *deep)
+	doImages, doCheck, doDeep, doCache := cleanCategories(*images, *check, *deep, *cacheGC)
 
+	// The cache category needs NO resolved keep-defaults and NO engine binary (it
+	// GCs the content-addressed ArtifactStore's own blobs, bounded by each store's
+	// own cap), so it runs even out-of-process. Only images/check/deep need the
+	// loader-resolved defaults.
+	var keepImages, keepCheck int
 	if doImages || doCheck || doDeep {
-		keepImages, keepCheck, derr := resolveRetentionDefaults(ctx, exec, dir)
+		var derr error
+		keepImages, keepCheck, derr = resolveRetentionDefaults(ctx, exec, dir)
 		if derr != nil {
 			return derr
 		}
+	}
+	if doImages || doCheck || doDeep || doCache {
 		out := runRetentionOutcome(spec.RetentionRequest{
-			Dir: dir, DryRun: *dryRun, Images: doImages, Check: doCheck, Deep: doDeep,
+			Dir: dir, DryRun: *dryRun, Images: doImages, Check: doCheck, Deep: doDeep, Cache: doCache,
 			Keep: *keep, KeepImages: keepImages, KeepCheckRuns: keepCheck,
 		})
 		if out.Reply.Error != "" {
 			return fmt.Errorf("%s", out.Reply.Error)
 		}
-		if perr := printRetentionResult(os.Stdout, tag, doImages, doCheck, doDeep, out); perr != nil {
+		if perr := printRetentionResult(os.Stdout, tag, doImages, doCheck, doDeep, doCache, out); perr != nil {
 			return perr
 		}
 	}
@@ -98,7 +107,7 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 // to raw `podman rmi -f`, which deletes the build-layer cache that makes the next build ~8x faster.
 // So each guarded category now prints the engine's SKIP line — naming the cause and the in-flight
 // build count — IN PLACE OF its removed count whenever the engine reports a skip.
-func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep bool, out retentionOutcome) error {
+func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, doCache bool, out retentionOutcome) error {
 	reply := out.Reply
 	var lines []string
 	if doImages {
@@ -127,6 +136,15 @@ func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep boo
 	if doDeep {
 		count := fmt.Sprintf("%s %d untagged image(s) store-wide (up to %s reclaimable — shared layers may reduce actual reclaim; pair with --invalidate for the fullest reclaim)", tag, len(reply.DeepIDs), kit.HumanBytes(reply.DeepBytes))
 		lines = append(lines, sweepLines("deep", out.DeepSkip, count, reply.DeepIDs)...)
+	}
+	if doCache {
+		if len(reply.CacheStores) == 0 {
+			lines = append(lines, "cache: no named cache stores found\n")
+		}
+		for _, s := range reply.CacheStores {
+			lines = append(lines, fmt.Sprintf("cache %s: %d live entry(ies); %s %d unreferenced blob(s) (%s)\n",
+				s.Name, s.Entries, tag, s.RemovedBlobs, kit.HumanBytes(s.RemovedBytes)))
+		}
 	}
 	if _, err := fmt.Fprint(w, strings.Join(lines, "")); err != nil {
 		return fmt.Errorf("printing the clean report: %w", err)
@@ -157,12 +175,13 @@ func sweepLines(label string, skip *retentionSkip, count string, items []string)
 // stays opt-in-only and the default `charly clean` behavior is unchanged. Passing --deep alone runs
 // ONLY the deep category (mirroring --invalidate's "runs ONLY this"); combine it with
 // --images/--check to run more than one category in one invocation.
-func cleanCategories(images, check, deep bool) (doImages, doCheck, doDeep bool) {
-	anyCategory := images || check || deep
+func cleanCategories(images, check, deep, cacheGC bool) (doImages, doCheck, doDeep, doCache bool) {
+	anyCategory := images || check || deep || cacheGC
 	doImages = images || !anyCategory
 	doCheck = check || !anyCategory
 	doDeep = deep
-	return doImages, doCheck, doDeep
+	doCache = cacheGC
+	return doImages, doCheck, doDeep, doCache
 }
 
 // resolveRetentionDefaults resolves defaults.keep_images/keep_check_runs PLUGIN-SIDE via the
