@@ -1,5 +1,5 @@
-// plugin-clean's OWN self-contained CUE schema — the SINGLE SOURCE for this plugin's
-// declaration surface, used two ways exactly like every other plugin's schema (there is
+// plugin-clean's OWN self-contained CUE schema — the plugin's declaration
+// surface, used two ways exactly like every other plugin's schema (there is
 // no schema-less plugin):
 //
 //  1. SERVE over Describe — the host splices `base ++ plugin` at the load gate, so the
@@ -15,8 +15,8 @@
 // (the property that lets the SDK compile it serve-side).
 #CleanPlugin: {
 	// The declared capability words (the plugin.providers surface) — the command:clean
-	// CLI plus the verb:retention engine peers invoke — so this schema and charly.yml's
-	// `plugin.providers:` list cannot silently drift.
+	// CLI plus the verb:retention engine peers invoke — recorded here as part of the
+	// plugin's published declaration surface.
 	providers: [...string]
 
 	// The command word the plugin serves.
@@ -28,7 +28,7 @@
 	// What the command does, in one line (the public-docs surface).
 	contract: string & !=""
 
-	// The configuration surface: env var names the plugin reads. Declared here so
-	// charly.yml's `env_accept:` list and this schema cannot silently drift.
+	// The configuration surface: env var names the plugin reads, recorded here as part
+	// of the plugin's published declaration surface.
 	config?: [string]: string
 }
