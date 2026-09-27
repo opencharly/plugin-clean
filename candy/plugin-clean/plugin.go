@@ -25,6 +25,7 @@ package clean
 
 import (
 	"context"
+	"embed"
 	"fmt"
 	"os"
 
@@ -32,20 +33,24 @@ import (
 	pb "github.com/opencharly/spec/proto"
 )
 
+//go:embed schema/*.cue
+var schemaFS embed.FS
+
 // NewProvider returns the clean provider.
 func NewProvider() pb.ProviderServer { return &provider{} }
 
 // NewMeta advertises command:clean (the CLI, dispatched via dispatchInProcCommand → Invoke(OpRun)
 // with the threaded in-proc reverse channel) and verb:retention (the engine, invoked directly by
-// core adapters / peer plugins — no authored plugin_input, mirroring verb:credential) — plus the
-// self-contained doc schema, via sdk.NewMeta.
+// core adapters / peer plugins — no authored plugin_input, mirroring verb:credential) — together
+// with this plugin's OWN self-contained CUE schema (schema/clean.cue) served over Describe. There
+// is NO schema-less plugin: the schema is the uniform surface every plugin presents.
 func NewMeta() pb.PluginMetaServer {
 	return sdk.NewMeta("2026.181.0001",
 		[]sdk.ProvidedCapability{
 			{Class: "command", Word: "clean"},
 			{Class: "verb", Word: "retention"},
 		},
-		nil)
+		schemaFS)
 }
 
 // CliMain is the out-of-process CLI entrypoint (only reached when clean is NOT compiled in). The
