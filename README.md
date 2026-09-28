@@ -1,18 +1,55 @@
 # plugin-clean
 
-The `plugin-clean` plugin candy of the [opencharly/charly](https://github.com/opencharly/charly)
-candy library, as a standalone repo (the candy de-submodule cutover, plugin
-kind). The Go module lives at `candy/plugin-clean/` with module path
-`github.com/opencharly/plugin-clean/candy/plugin-clean`; the charly resolver fetches this repo at the pinned tag and
-the compiled-in wiring imports the module at that path.
+The `charly clean` build-artifact retention/prune surface for OpenCharly — served
+as a charly `command:clean` plugin (compiled-in), plus the shared retention
+engine as `verb:retention`.
 
-## Platforms
+The plugin owns the flag grammar, the category orchestration, the report output,
+AND the retention engine itself (`retention.go`). Peer plugins
+(`candy/plugin-box`'s post-build prune / `box list tags`, `candy/plugin-check`'s
+post-run prune) reach the engine over `verb:retention`.
 
-Builds for `linux/amd64`, `linux/arm64`, `linux/arm/v7` and `linux/386`. The 32-bit targets
-work because of the sdk's 32-bit fix
-([opencharly/sdk#263](https://github.com/opencharly/sdk/pull/263), issue
-[#262](https://github.com/opencharly/sdk/issues/262)) — `charly`'s loader
-host-builds this plugin with `CGO_ENABLED=0`, so the artifact is a static
-binary, which is what a 32-bit appliance without a glibc toolchain (such as
-a JetKVM's uClibc armv7 userland) runs. Nothing extra is needed to use it: install
-`charly` and it builds the plugin for the host it runs on.
+## What it provides
+
+| Capability | Surface |
+|---|---|
+| `command:clean` | the `charly clean` CLI — `--dry-run`, `--images`, `--check`, `--deep`, `--cache`, `--keep`, `--invalidate` |
+| `verb:retention` | the shared retention engine, invoked by peer plugins |
+
+## The command
+
+- **default** — the charly-labeled dangling-image sweep.
+- **`--images`** — prune images by the retention policy (`keep_images`).
+- **`--check`** — prune `.check` runs (`keep_check_runs`).
+- **`--cache`** — the CAS `ArtifactStore` GC.
+- **`--deep`** — the store-wide untagged/dangling-image purge (the CLI-only
+  gap-closing capability). Strictly opt-in; never fires on a plain `charly
+  clean`. `--deep --dry-run` reports the would-remove count + an UPPER-BOUND
+  reclaimable-bytes figure and touches nothing.
+- **`--invalidate`** — remove stale image TAGS (freeing their exclusively-held
+  layers).
+
+While any build is in flight the dangling-image sweeps remove NOTHING and print
+`<label>: SKIPPED — N build(s) in flight` in place of the removed count — a
+declined sweep never looks like an empty store.
+
+## How to use it
+
+Compose the plugin candy in a box's `candy:` list:
+
+```yaml
+- '@github.com/opencharly/plugin-clean/candy/plugin-clean:<tag>'
+```
+
+## Layout
+
+- `candy/plugin-clean/` — the plugin module: `plugin.go`, `provider.go`,
+  `command.go`, `retention.go`, `schema/clean.cue`, `cmd/serve/main.go`.
+- `charly.yml` — the root project manifest (`discover: candy`).
+- `.github/workflows/tag-on-merge.yml` — CalVer tag + `CHANGELOG/` on merge.
+
+## Related
+
+- Owning skill: `/charly-core:clean` — the `charly clean` reference.
+- `/charly-check:check` — the R10 bed that witnesses `--dry-run` / `--deep`.
+- [`opencharly/charly`](https://github.com/opencharly/charly) — the charly CLI.
