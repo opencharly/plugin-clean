@@ -70,11 +70,16 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 
 	doImages, doCheck, doDeep, doCache, doScopes := cleanCategories(*images, *check, *deep, *cacheGC, *scopes)
 
-	// The cache category needs NO resolved keep-defaults and NO engine binary (it
-	// GCs the content-addressed ArtifactStore's own blobs, bounded by each store's
-	// own cap), so it runs even out-of-process; the scopes category needs neither,
-	// so it runs out-of-process too. Only images/check/deep need the
-	// loader-resolved defaults.
+	// Two independent capabilities are needed per category, and only the categories that use them
+	// pay for them:
+	//
+	//   * the loader-resolved keep-defaults — only `--images` and `--check` (and `--deep`, which
+	//     resolves them for the report's counts). Resolved PLUGIN-SIDE through the in-proc reverse
+	//     channel, so those three need compiled-in placement; `--cache` and `--scopes` do not.
+	//   * the container engine — only the categories that touch the container store: `--images`,
+	//     `--deep` and `--invalidate`/`list`. The engine is resolved INSIDE runRetentionOutcome for
+	//     exactly those, so `--cache`, `--check` and `--scopes` run on a host whose podman is absent
+	//     or broken, which is the state a host with a hung build scope is most likely to be in.
 	var keepImages, keepCheck int
 	if doImages || doCheck || doDeep {
 		var derr error

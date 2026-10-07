@@ -80,9 +80,10 @@ type retentionOutcome struct {
 	// scopes it stopped, or would stop under a dry run. It rides HERE, not on spec.RetentionReply,
 	// for the same reason the skip signals do: the reaper is a HOST-HYGIENE surface reached only by
 	// `charly clean`'s own CLI — no peer asks for it over verb:retention (a peer's post-build or
-	// post-run prune must never stop a scope), and it needs neither the engine binary nor the
-	// resolved keep-defaults. Adding a field to the shared wire type to carry a reply no peer reads
-	// would be a cross-repo change for no consumer.
+	// post-run prune must never stop a scope) — and it needs neither the resolved keep-defaults nor
+	// the container engine (see runRetentionOutcome's needsEngine: only the store-touching categories
+	// resolve one). Adding a field to the shared wire type to carry a reply no peer reads would be a
+	// cross-repo change for no consumer.
 	Scopes []string
 
 	// ScopeSkip is set when the scope reaper declined on a guard (a live build, or no user systemd
@@ -96,9 +97,21 @@ type retentionOutcome struct {
 // scopes is the CLI-only transient build-scope category (see retentionOutcome.Scopes); every
 // peer/wire caller passes false.
 func runRetentionOutcome(req spec.RetentionRequest, scopes bool) retentionOutcome {
-	engineBin, err := resolveEngineBinary()
-	if err != nil {
-		return retentionOutcome{Reply: spec.RetentionReply{Error: err.Error()}}
+	// The engine is resolved ONLY for the categories that touch the container store. Four of them
+	// never do: the scope reaper (systemd + /proc), the check-run sweep and the .build staging sweep
+	// (filesystem), and the cache GC (the CAS blob store). Resolving it up front made every one of
+	// them a hard ERROR on a host with no podman — including `charly clean --scopes`, i.e. the one
+	// category that matters most on a host whose engine is broken, since a hung build scope is a
+	// residue of a build that already failed. Both this file's and the candy description's "needs
+	// neither the engine binary nor the resolved keep-defaults" are therefore true by construction,
+	// not by assertion, and TestScopesOnlyRunNeedsNoEngine pins it.
+	needsEngine := req.Invalidate != "" || req.List || req.BuildPrune || req.Images || req.Deep
+	var engineBin string
+	if needsEngine {
+		var err error
+		if engineBin, err = resolveEngine(); err != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: err.Error()}}
+		}
 	}
 
 	// --invalidate: targeted image-tag invalidation ONLY (matches the CLI's early return).
@@ -225,6 +238,12 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
 
 // resolveEngineBinary resolves the container engine binary via kit.ResolveRuntime — the
 // same resolver every other engine-shelling site uses.
+// resolveEngine is the engine-resolution seam (a package-level var for the same reason
+// liveBuildFloor / listDanglingImages / listBuildScopes are): a test can prove which categories
+// require it without an engine on PATH, which is exactly the property Block A1 asked this cutover
+// to pin rather than assert.
+var resolveEngine = resolveEngineBinary
+
 func resolveEngineBinary() (string, error) {
 	rt, err := kit.ResolveRuntime()
 	if err != nil {

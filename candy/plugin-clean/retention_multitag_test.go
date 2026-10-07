@@ -124,8 +124,10 @@ func TestPruneImagesByRetention_MultiTagGroupSurvivesIntact(t *testing.T) {
 	// would otherwise let the assertions above pass for the wrong reason.
 	if !got[plainCanary] {
 		t.Errorf("the distinct sibling past the budget was NOT selected: %s\n"+
-			"  it is rank 3 at keep_images=3, datable, and unreferenced;\n"+
-			"  if this stops being selected the test above is passing vacuously", rankTail)
+			"  it is rank 4 at keep_images=3 (the oldest of the five rows), datable by its plain\n"+
+			"  CalVer tag, and unreferenced; if it stops being selected — while the exempt\n"+
+			"  bed-tagged sibling above stays unselected — the assertions above pass vacuously",
+			plainCanary)
 	}
 
 	if len(removed) != 1 {
