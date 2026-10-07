@@ -40,6 +40,7 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 	check := fs.Bool("check", false, "Only check-run retention")
 	deep := fs.Bool("deep", false, "Purge every untagged/dangling image in local storage (not just charly-labeled) plus any layer blobs they alone held — reports UP TO the summed image size, since layers SHARED with kept images reduce actual reclaim; pair with --invalidate for the fullest reclaim. Runs ONLY this category unless combined with --images/--check")
 	cacheGC := fs.Bool("cache", false, "Reclaim unreferenced blobs from every named charly cache (the content-addressed ArtifactStore's own GC); reports each store's live entries + reclaimed blobs/bytes. Runs ONLY this category unless combined with --images/--check/--deep")
+	scopes := fs.Bool("scopes", false, "Reap HUNG transient build scopes — the systemd user scopes buildah/podman put a build container into (e.g. runc-buildah-*.scope). A scope is stopped only when it has been active for at least "+buildScopeMaxAge.String()+" AND no buildah/podman builder process is alive anywhere on the host. Runs by default and with --deep; any other explicit category suppresses it")
 	keep := fs.Int("keep", 0, "Override the retention count for this run (0 = use defaults:)")
 	invalidate := fs.String("invalidate", "", "Remove every charly-labeled image tag matching this glob (full ref or last path segment); runs ONLY the invalidation")
 	if err := fs.Parse(args); err != nil {
@@ -67,11 +68,12 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 		return nil
 	}
 
-	doImages, doCheck, doDeep, doCache := cleanCategories(*images, *check, *deep, *cacheGC)
+	doImages, doCheck, doDeep, doCache, doScopes := cleanCategories(*images, *check, *deep, *cacheGC, *scopes)
 
 	// The cache category needs NO resolved keep-defaults and NO engine binary (it
 	// GCs the content-addressed ArtifactStore's own blobs, bounded by each store's
-	// own cap), so it runs even out-of-process. Only images/check/deep need the
+	// own cap), so it runs even out-of-process; the scopes category needs neither,
+	// so it runs out-of-process too. Only images/check/deep need the
 	// loader-resolved defaults.
 	var keepImages, keepCheck int
 	if doImages || doCheck || doDeep {
@@ -81,15 +83,15 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 			return derr
 		}
 	}
-	if doImages || doCheck || doDeep || doCache {
+	if doImages || doCheck || doDeep || doCache || doScopes {
 		out := runRetentionOutcome(spec.RetentionRequest{
 			Dir: dir, DryRun: *dryRun, Images: doImages, Check: doCheck, Deep: doDeep, Cache: doCache,
 			Keep: *keep, KeepImages: keepImages, KeepCheckRuns: keepCheck,
-		})
+		}, doScopes)
 		if out.Reply.Error != "" {
 			return fmt.Errorf("%s", out.Reply.Error)
 		}
-		if perr := printRetentionResult(os.Stdout, tag, doImages, doCheck, doDeep, doCache, out); perr != nil {
+		if perr := printRetentionResult(os.Stdout, tag, doImages, doCheck, doDeep, doCache, doScopes, out); perr != nil {
 			return perr
 		}
 	}
@@ -107,7 +109,7 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 // to raw `podman rmi -f`, which deletes the build-layer cache that makes the next build ~8x faster.
 // So each guarded category now prints the engine's SKIP line — naming the cause and the in-flight
 // build count — IN PLACE OF its removed count whenever the engine reports a skip.
-func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, doCache bool, out retentionOutcome) error {
+func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, doCache, doScopes bool, out retentionOutcome) error {
 	reply := out.Reply
 	var lines []string
 	if doImages {
@@ -136,6 +138,13 @@ func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, do
 	if doDeep {
 		count := fmt.Sprintf("%s %d untagged image(s) store-wide (up to %s reclaimable — shared layers may reduce actual reclaim; pair with --invalidate for the fullest reclaim)", tag, len(reply.DeepIDs), kit.HumanBytes(reply.DeepBytes))
 		lines = append(lines, sweepLines("deep", out.DeepSkip, count, reply.DeepIDs)...)
+	}
+	if doScopes {
+		// The scope reaper's count line names the guard's own age bound, so a reader can tell
+		// "nothing is hung" from "nothing is old enough to judge" without reading the flag help.
+		lines = append(lines, sweepLines("scopes", out.ScopeSkip,
+			fmt.Sprintf("%s %d hung transient build scope(s) (active > %s, no live builder)",
+				tag, len(out.Scopes), buildScopeMaxAge), out.Scopes)...)
 	}
 	if doCache {
 		if len(reply.CacheStores) == 0 {
@@ -166,22 +175,32 @@ func sweepLines(label string, skip *retentionSkip, count string, items []string)
 	return lines
 }
 
-// cleanCategories resolves the --images/--check/--deep flags into which categories run this
-// invocation. --images and --check keep their pre-existing "only this" semantics (any one given
-// alone suppresses the other default categories). --deep joins that same "explicit category" gate
-// but NEVER fires implicitly: on a plain `charly clean` (no flags at all) doDeep is always false —
-// the store-wide untagged-image sweep is a strictly broader operation than the default
+// cleanCategories resolves the --images/--check/--deep/--cache/--scopes flags into which categories
+// run this invocation. --images and --check keep their pre-existing "only this" semantics (any one
+// given alone suppresses the other default categories). --deep joins that same "explicit category"
+// gate but NEVER fires implicitly: on a plain `charly clean` (no flags at all) doDeep is always
+// false — the store-wide untagged-image sweep is a strictly broader operation than the default
 // per-charly-labeled retention (it can remove far more, and scans the whole local store), so it
-// stays opt-in-only and the default `charly clean` behavior is unchanged. Passing --deep alone runs
-// ONLY the deep category (mirroring --invalidate's "runs ONLY this"); combine it with
-// --images/--check to run more than one category in one invocation.
-func cleanCategories(images, check, deep, cacheGC bool) (doImages, doCheck, doDeep, doCache bool) {
-	anyCategory := images || check || deep || cacheGC
+// stays opt-in-only. Passing --deep alone runs ONLY the deep category (mirroring --invalidate's
+// "runs ONLY this"); combine it with --images/--check to run more than one category in one
+// invocation.
+//
+// --scopes is the one category that runs BOTH by default AND with --deep, and the reason is
+// asymmetry of harm rather than of breadth: the reaper is safe by construction (build-scope family
+// + active for at least buildScopeMaxAge + no live builder process anywhere + charly's own
+// live-build lock held), while what it prevents is NOT a disk-footprint problem but a whole-host
+// one — opencharly/plugin-clean#11 measured a single orphaned build scope spinning for SEVEN DAYS
+// at 309% CPU and 12.27 load on 16 cores, starving every bed on the host. A hung scope is also the
+// one leftover `charly clean` had no category for at all. `--scopes` alone runs ONLY the scope
+// category; any other explicit category suppresses it, like every other category here.
+func cleanCategories(images, check, deep, cacheGC, scopes bool) (doImages, doCheck, doDeep, doCache, doScopes bool) {
+	anyCategory := images || check || deep || cacheGC || scopes
 	doImages = images || !anyCategory
 	doCheck = check || !anyCategory
 	doDeep = deep
 	doCache = cacheGC
-	return doImages, doCheck, doDeep, doCache
+	doScopes = scopes || deep || !anyCategory
+	return doImages, doCheck, doDeep, doCache, doScopes
 }
 
 // resolveRetentionDefaults resolves defaults.keep_images/keep_check_runs PLUGIN-SIDE via the
