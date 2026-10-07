@@ -8,56 +8,66 @@ import (
 	"github.com/opencharly/spec/spec"
 )
 
-// TestCleanCategories covers the --images/--check/--deep flag-resolution logic: the pre-existing
-// "any one of --images/--check given alone suppresses the other default categories" behavior stays
-// unchanged, and --deep NEVER fires implicitly on a plain `charly clean` (R5: no default-behavior
-// change) but joins the same "an explicit category was given" gate as --images/--check.
+// TestCleanCategories covers the --images/--check/--deep/--cache/--scopes flag-resolution logic:
+// the pre-existing "any one of --images/--check given alone suppresses the other default
+// categories" behavior stays unchanged, --deep NEVER fires implicitly on a plain `charly clean`
+// (R5: no default-behavior change) but joins the same "an explicit category was given" gate as
+// --images/--check, and --scopes is the one category that runs BOTH by default and with --deep —
+// because it is safe by construction and prevents a whole-host starvation rather than a disk
+// footprint (opencharly/plugin-clean#11: a seven-day orphaned build scope at 12.27/16 load).
 func TestCleanCategories(t *testing.T) {
 	cases := []struct {
-		name                            string
-		images, check, deep, cacheGC    bool
-		wantImages, wantCheck, wantDeep bool
-		wantCache                       bool
+		name                                        string
+		images, check, deep, cacheGC, scopes        bool
+		wantImages, wantCheck, wantDeep, wantScopes bool
+		wantCache                                   bool
 	}{
-		{name: "no flags: full default sweep, deep excluded",
+		{name: "no flags: full default sweep, scopes included, deep excluded",
 			images: false, check: false, deep: false,
-			wantImages: true, wantCheck: true, wantDeep: false},
-		{name: "--images alone: only images",
+			wantImages: true, wantCheck: true, wantDeep: false, wantScopes: true},
+		{name: "--images alone: only images, no scopes",
 			images: true, check: false, deep: false,
-			wantImages: true, wantCheck: false, wantDeep: false},
-		{name: "--check alone: only check",
+			wantImages: true, wantCheck: false, wantDeep: false, wantScopes: false},
+		{name: "--check alone: only check, no scopes",
 			images: false, check: true, deep: false,
-			wantImages: false, wantCheck: true, wantDeep: false},
-		{name: "--images + --check: both",
+			wantImages: false, wantCheck: true, wantDeep: false, wantScopes: false},
+		{name: "--images + --check: both, no scopes",
 			images: true, check: true, deep: false,
-			wantImages: true, wantCheck: true, wantDeep: false},
-		{name: "--deep alone: only deep",
+			wantImages: true, wantCheck: true, wantDeep: false, wantScopes: false},
+		{name: "--deep alone: deep AND scopes",
 			images: false, check: false, deep: true,
-			wantImages: false, wantCheck: false, wantDeep: true},
-		{name: "--deep + --images: both, check excluded",
+			wantImages: false, wantCheck: false, wantDeep: true, wantScopes: true},
+		{name: "--deep + --images: both, check excluded, scopes from deep",
 			images: true, check: false, deep: true,
-			wantImages: true, wantCheck: false, wantDeep: true},
-		{name: "--deep + --check: both, images excluded",
+			wantImages: true, wantCheck: false, wantDeep: true, wantScopes: true},
+		{name: "--deep + --check: both, images excluded, scopes from deep",
 			images: false, check: true, deep: true,
-			wantImages: false, wantCheck: true, wantDeep: true},
-		{name: "all three flags: all categories",
+			wantImages: false, wantCheck: true, wantDeep: true, wantScopes: true},
+		{name: "all three flags: all four categories",
 			images: true, check: true, deep: true,
-			wantImages: true, wantCheck: true, wantDeep: true},
-		{name: "--cache alone: only cache (never images/check)",
+			wantImages: true, wantCheck: true, wantDeep: true, wantScopes: true},
+		{name: "--cache alone: only cache (never images/check/scopes)",
 			images: false, check: false, deep: false, cacheGC: true,
-			wantImages: false, wantCheck: false, wantDeep: false, wantCache: true},
-		{name: "--cache + --images: both, check excluded",
+			wantImages: false, wantCheck: false, wantDeep: false, wantCache: true, wantScopes: false},
+		{name: "--cache + --images: both, check and scopes excluded",
 			images: true, check: false, deep: false, cacheGC: true,
-			wantImages: true, wantCheck: false, wantDeep: false, wantCache: true},
+			wantImages: true, wantCheck: false, wantDeep: false, wantCache: true, wantScopes: false},
+		{name: "--scopes alone: ONLY scopes (no images/check)",
+			images: false, check: false, deep: false, scopes: true,
+			wantImages: false, wantCheck: false, wantDeep: false, wantScopes: true},
+		{name: "--scopes + --images: both, check excluded",
+			images: true, check: false, deep: false, scopes: true,
+			wantImages: true, wantCheck: false, wantDeep: false, wantScopes: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotImages, gotCheck, gotDeep, gotCache := cleanCategories(c.images, c.check, c.deep, c.cacheGC)
-			if gotImages != c.wantImages || gotCheck != c.wantCheck || gotDeep != c.wantDeep || gotCache != c.wantCache {
-				t.Errorf("cleanCategories(%v,%v,%v,%v) = (%v,%v,%v,%v), want (%v,%v,%v,%v)",
-					c.images, c.check, c.deep, c.cacheGC,
-					gotImages, gotCheck, gotDeep, gotCache,
-					c.wantImages, c.wantCheck, c.wantDeep, c.wantCache)
+			gotImages, gotCheck, gotDeep, gotCache, gotScopes := cleanCategories(c.images, c.check, c.deep, c.cacheGC, c.scopes)
+			if gotImages != c.wantImages || gotCheck != c.wantCheck || gotDeep != c.wantDeep ||
+				gotCache != c.wantCache || gotScopes != c.wantScopes {
+				t.Errorf("cleanCategories(%v,%v,%v,%v,%v) = (%v,%v,%v,%v,%v), want (%v,%v,%v,%v,%v)",
+					c.images, c.check, c.deep, c.cacheGC, c.scopes,
+					gotImages, gotCheck, gotDeep, gotCache, gotScopes,
+					c.wantImages, c.wantCheck, c.wantDeep, c.wantCache, c.wantScopes)
 			}
 		})
 	}
@@ -83,7 +93,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			Reply:    spec.RetentionReply{DeepIDs: []string{"sha256:aaaa"}, DeepBytes: 45 << 30},
 			DeepSkip: skipImages,
 		}
-		if err := printRetentionResult(&buf, "removed", false, false, true, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", false, false, true, false, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		if got := buf.String(); got != wantDeepSkip {
@@ -102,7 +112,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			DanglingSkip: skipImages,
 			StagingSkip:  skipStaging,
 		}
-		if err := printRetentionResult(&buf, "removed", true, false, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", true, false, false, false, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		want := "images: removed 0 tag(s) (keep_images=3)\n" + wantDanglingSkip + wantStagingSkip +
@@ -121,7 +131,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			DeepIDs:     []string{"sha256:aaaa", "sha256:cccc"},
 			DeepBytes:   45 << 30,
 		}}
-		if err := printRetentionResult(&buf, "removed", true, false, true, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", true, false, true, false, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := buf.String()
@@ -146,7 +156,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 	t.Run("empty staging is still reported", func(t *testing.T) {
 		var buf bytes.Buffer
 		out := retentionOutcome{Reply: spec.RetentionReply{KeepImages: 3}}
-		if err := printRetentionResult(&buf, "removed", true, false, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", true, false, false, false, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		want := "images: removed 0 tag(s) (keep_images=3)\n" +
@@ -170,7 +180,7 @@ func TestPrintRetentionResult_CacheCategory(t *testing.T) {
 			{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20},
 			{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0},
 		}}}
-		if err := printRetentionResult(&buf, "removed", false, false, false, true, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", false, false, false, true, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := buf.String()
@@ -187,7 +197,7 @@ func TestPrintRetentionResult_CacheCategory(t *testing.T) {
 	t.Run("no stores", func(t *testing.T) {
 		var buf bytes.Buffer
 		out := retentionOutcome{Reply: spec.RetentionReply{}}
-		if err := printRetentionResult(&buf, "would remove", false, false, false, true, out); err != nil {
+		if err := printRetentionResult(&buf, "would remove", false, false, false, true, false, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		if want := "cache: no named cache stores found\n"; buf.String() != want {

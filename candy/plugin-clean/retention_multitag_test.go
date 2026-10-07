@@ -22,12 +22,18 @@ import (
 // alongside the new one). The literal is frozen deliberately: reading the live store here would
 // trade determinism back for host state, and the group WILL drift.
 //
-// Ordering note: all four images carry an identical ai.opencharly.version label, so the
-// comparator falls through the label CalVer and labelled-ness keys to CREATION TIME — which is
-// why the Created values, not the tag strings, establish the ranks. The tags are bed-shaped
-// (`check-<bed>-<calver>`), which ExtractCalVerTag reports as EMPTY, so tag CalVer orders
-// nothing here. That is the ordering the engine documents and the reason creation time precedes
-// the tag.
+// Ordering note: all rows carry an identical ai.opencharly.version label, which is NO LONGER an
+// ordering key at all (opencharly/plugin-clean#10 — the label is a cutover-boundary artifact and
+// ordering by it inverted recency). CREATION TIME is the primary key, so the Created values, not
+// the tag strings, establish the ranks. The tags are bed-shaped (`check-<bed>-<calver>`), which
+// ExtractCalVerTag reports as EMPTY, so tag CalVer orders nothing here either.
+//
+// The exemption note is load-bearing for the canary below: with the label gone, a row whose ONLY
+// tag is bed-shaped is UNDATABLE and therefore exempt from removal (retentionRemovable guards on
+// `!OkTag` alone). That is why this fixture now carries one extra, plain-CalVer row as the
+// vacuity canary, and why the observed rank-tail sibling is asserted to be EXEMPT rather than
+// removed. Widening the datability of a bed tag belongs to the `spec` owner of
+// container.ExtractCalVerTag, not here.
 //
 // Pairs with TestPruneImagesByRetention_SharedID, which proves the shared-id ranking; this one
 // proves a multi-tag image survives INTACT while the distinct sibling past the budget does not.
@@ -49,6 +55,9 @@ func TestPruneImagesByRetention_MultiTagGroupSurvivesIntact(t *testing.T) {
 		multiTagB = "ghcr.io/opencharly/fedora-nonfree:check-marketplace-2026.228.0010"
 		multiTagC = "ghcr.io/opencharly/fedora-nonfree:check-sidecar-pod-2026.228.0221"
 		rankTail  = "ghcr.io/opencharly/fedora-nonfree:check-docs-2026.227.1835"
+		// plainCanary carries a PLAIN CalVer tag — the shape retention can still date, and the
+		// only row in this fixture whose selection proves the sweep is running at all.
+		plainCanary = "ghcr.io/opencharly/fedora-nonfree:2026.227.0900"
 	)
 	lbl := func() map[string]string {
 		return map[string]string{
@@ -67,9 +76,16 @@ func TestPruneImagesByRetention_MultiTagGroupSurvivesIntact(t *testing.T) {
 		// last two fell outside the budget.
 		{ID: "e91486ab32f7", Created: 1786825413, Labels: lbl(), Names: []string{
 			multiTagA, multiTagB, multiTagC}},
-		// The distinct sibling past the budget: rank 3, removable on BOTH code paths. Present so
-		// the fixture cannot pass by pruning nothing at all.
+		// The distinct sibling past the budget: rank 3. Its only tag is bed-shaped, which
+		// ExtractCalVerTag reads as NO CalVer, so with the dead label gone it is EXEMPT — asserted
+		// below, never silently dropped from the fixture.
 		{ID: "8241fa641a54", Created: 1786818957, Labels: lbl(), Names: []string{rankTail}},
+		// The vacuity canary: the OLDEST distinct image, wearing a PLAIN CalVer tag. Rank 4 (past
+		// keep_images=3) AND datable AND unreferenced, so it must be selected — the one row here
+		// that fails if the fixture ever stops pruning at all. Added by this cutover because the
+		// observed rank-tail row above is now exempt; the four rows above stay frozen as observed.
+		{ID: "5c0a1b2d3e4f", Created: 1786818000, Labels: lbl(), Names: []string{
+			"ghcr.io/opencharly/fedora-nonfree:2026.227.0900"}},
 	}
 	kit.ListLocalImages = func(string) ([]kit.LocalImageInfo, error) { return group, nil }
 
@@ -93,11 +109,20 @@ func TestPruneImagesByRetention_MultiTagGroupSurvivesIntact(t *testing.T) {
 		}
 	}
 
-	// The NON-discriminating half, kept as the vacuity check: true on both code paths, so it
-	// proves nothing on its own — but it fails if the fixture ever stops pruning at all (a guard
-	// engaging, keepN mis-resolved, the group mis-keyed), which is what would otherwise let the
-	// assertions above pass for the wrong reason.
-	if !got[rankTail] {
+	// The bed-tagged sibling is EXEMPT — the post-cutover truth, pinned rather than left implicit.
+	// Its only tag carries no CalVer a parser can read, and the key that used to date it
+	// (ai.opencharly.version) is never emitted, so retention refuses to remove it: the fail-safe
+	// direction, since removing a row we cannot date is how an artifact disappears unremarked.
+	if got[rankTail] {
+		t.Errorf("the bed-tagged sibling past the budget was selected: %s\n"+
+			"  its only tag is bed-shaped, so with the dead label gone it is undatable and must be "+
+			"exempt (retentionRemovable guards on !OkTag alone)", rankTail)
+	}
+
+	// The NON-discriminating half, kept as the vacuity check: it fails if the fixture ever stops
+	// pruning at all (a guard engaging, keepN mis-resolved, the group mis-keyed), which is what
+	// would otherwise let the assertions above pass for the wrong reason.
+	if !got[plainCanary] {
 		t.Errorf("the distinct sibling past the budget was NOT selected: %s\n"+
 			"  it is rank 3 at keep_images=3, datable, and unreferenced;\n"+
 			"  if this stops being selected the test above is passing vacuously", rankTail)
@@ -108,18 +133,19 @@ func TestPruneImagesByRetention_MultiTagGroupSurvivesIntact(t *testing.T) {
 	}
 }
 
-// TestRetentionUndatableGuardIsAnAND pins the exemption's exact width. The guard is
-// `!OkLabel && !OkTag`, so a row is protected only when NEITHER key can date it. A `:latest` on an
-// image that carries a datable ai.opencharly.version label has OkLabel == true and is therefore
-// RECLAIMABLE by tag ordinal — the opposite of what a comment in this file used to claim
-// ("can never be elected for removal however many tags its image wears", the OR reading).
+// TestRetentionUndatableGuardUsesTheOneLiveKey pins the exemption's exact width after the
+// opencharly/plugin-clean#10 cutover. The guard used to be `!OkLabel && !OkTag` — an AND over the
+// ai.opencharly.version label and the build tag — and this test used to pin the consequence that
+// a datable LABEL defeated the exemption. The label is never emitted any more, so that AND had a
+// constant for a term, and keeping it would have kept alive the very key whose ordering inversion
+// is that issue. The guard is now `!OkTag`: the build tag is the ONE datable key left, so a row
+// whose tag carries no `:YYYY.DDD.HHMM` is protected however many tags its image wears.
 //
-// This matters more than it sounds: the version label is a DECLARED version
-// (deploykit.ComputeEffectiveVersions — the box's version:, else the highest candy version:, else
-// the base's), not a content hash, so nearly every charly-built image carries one. The exemption
-// protects far fewer rows than its name suggests, and `latest` on a managed image is not among
-// them. Perturbing the guard to `||` makes the labelled case pass and this test fail.
-func TestRetentionUndatableGuardIsAnAND(t *testing.T) {
+// The label is therefore IRRELEVANT here: the two cases below differ only in it, and BOTH must
+// protect their surplus undatable tags. Re-wiring the guard to read the label again makes the
+// labelled case reclaim rows whose tags cannot date them — the fail-safe direction inverted, and
+// on a store spanning the cutover, the inversion itself.
+func TestRetentionUndatableGuardUsesTheOneLiveKey(t *testing.T) {
 	origList, origCtr, origFloor := kit.ListLocalImages, listContainerImageRefs, liveBuildFloor
 	defer func() { kit.ListLocalImages, listContainerImageRefs, liveBuildFloor = origList, origCtr, origFloor }()
 	liveBuildFloor = func() (kit.CalVer, bool, int) { return kit.CalVer{}, false, 0 }
@@ -143,17 +169,31 @@ func TestRetentionUndatableGuardIsAnAND(t *testing.T) {
 		return removed
 	}
 
-	// Datable LABEL present -> OkLabel true -> the AND does NOT protect -> surplus tags removable.
+	// Datable LABEL present -> IRRELEVANT (never emitted) -> the tag is undatable -> exempt.
 	labelled := run(map[string]string{"ai.opencharly.box": "x", "ai.opencharly.version": "2026.100.0000"})
-	if len(labelled) == 0 {
-		t.Errorf("a datable ai.opencharly.version label must defeat the undatable exemption, "+
-			"leaving surplus undatable tags reclaimable by tag ordinal — got %d removals", len(labelled))
+	if len(labelled) != 0 {
+		t.Errorf("a dead ai.opencharly.version label must NOT date a row: the exemption reads the "+
+			"ONE remaining datable key (the build tag), so nothing here is removable — got %d "+
+			"removals: %v", len(labelled), labelled)
 	}
 
-	// NEITHER key datable -> the exemption applies -> nothing removable, however many tags.
+	// No label -> identical outcome, since the label plays no part.
 	unlabelled := run(map[string]string{"ai.opencharly.box": "x"})
 	if len(unlabelled) != 0 {
-		t.Errorf("with neither a datable label nor a datable tag the exemption must protect every "+
-			"row however many tags the image wears — got %d removals: %v", len(unlabelled), unlabelled)
+		t.Errorf("with an undatable tag the exemption must protect every row however many tags "+
+			"the image wears — got %d removals: %v", len(unlabelled), unlabelled)
+	}
+
+	// The other half of the guard: a DATABLE tag past the budget IS reclaimable, so the
+	// exemption above cannot pass by disabling the tag ordinal wholesale.
+	datable := []kit.LocalImageInfo{{ID: "bbb", Created: 200, Labels: map[string]string{"ai.opencharly.box": "y"},
+		Names: []string{"ghcr/y:2026.001.0300", "ghcr/y:2026.001.0200", "ghcr/y:2026.001.0100"}}}
+	kit.ListLocalImages = func(string) ([]kit.LocalImageInfo, error) { return datable, nil }
+	got, err := pruneImagesByRetention("podman", 1, true)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(got) == 0 {
+		t.Errorf("datable surplus tags past keep_images=1 must still be reclaimable — got none")
 	}
 }
