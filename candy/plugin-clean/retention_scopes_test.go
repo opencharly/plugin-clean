@@ -1,12 +1,17 @@
 package clean
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/opencharly/sdk/kit"
 	"github.com/opencharly/spec/spec"
 )
+
+// errTestNoEngine stands in for "this host has no working podman/docker" — the condition the
+// scopes category must survive and the store-touching categories must surface.
+var errTestNoEngine = errors.New("no container engine found (install podman or docker)")
 
 // TestCharlyImageTags_DeadLabelCannotInvertRecency is the opencharly/plugin-clean#10 regression
 // guard, and it is the one retention test in this package whose failure mode DESTROYS an artifact
@@ -285,5 +290,54 @@ func TestReapBuildScopes_DecisionIsUnreachableFromTheWireRequest(t *testing.T) {
 	out := runRetentionOutcome(spec.RetentionRequest{Cache: true}, false)
 	if len(out.Scopes) != 0 || len(stopped) != 0 {
 		t.Fatalf("the wire form stopped a scope: scopes=%v stopped=%v", out.Scopes, stopped)
+	}
+}
+
+// TestScopesOnlyRunNeedsNoEngine pins the claim the review asked this cutover to make true rather
+// than assert: the scope reaper needs no container engine. `runRetentionOutcome` used to resolve one
+// unconditionally, so `charly clean --scopes` — the category that matters MOST on a host whose
+// engine is broken, since a hung build scope is the residue of a build that already failed — died
+// with an engine-resolution error before it could reap anything. The negative control below (an
+// images-only run must still fail) is what stops this passing by disabling the resolution entirely.
+func TestScopesOnlyRunNeedsNoEngine(t *testing.T) {
+	origEngine, origScopes, origLive, origStop, origReady := resolveEngine, listBuildScopes, liveBuilderParents, stopBuildScope, userSystemdBusReady
+	origFloor := liveBuildFloor
+	defer func() {
+		resolveEngine, listBuildScopes, liveBuilderParents, stopBuildScope, userSystemdBusReady = origEngine, origScopes, origLive, origStop, origReady
+		liveBuildFloor = origFloor
+	}()
+
+	resolved := 0
+	resolveEngine = func() (string, error) {
+		resolved++
+		return "", errTestNoEngine
+	}
+	liveBuildFloor = func() (kit.CalVer, bool, int) { return kit.CalVer{}, false, 0 }
+	userSystemdBusReady = func() bool { return true }
+	liveBuilderParents = func() (bool, error) { return false, nil }
+	var stopped []string
+	stopBuildScope = func(unit string) error { stopped = append(stopped, unit); return nil }
+	listBuildScopes = func() ([]buildScope, error) {
+		return []buildScope{{Unit: "runc-buildah-buildahHUNG.scope", AgeSeconds: 7 * 24 * 3600}}, nil
+	}
+
+	// The scopes-only run must reap WITHOUT ever resolving an engine.
+	out := runRetentionOutcome(spec.RetentionRequest{DryRun: true}, true)
+	if out.Reply.Error != "" {
+		t.Fatalf("a scopes-only run failed on engine resolution: %s", out.Reply.Error)
+	}
+	if resolved != 0 {
+		t.Fatalf("the scopes-only run resolved the engine %d time(s); it must not need one", resolved)
+	}
+	if len(out.Scopes) != 1 {
+		t.Fatalf("the scopes-only run reaped %v, want the hung scope", out.Scopes)
+	}
+
+	// The negative control: an images-only run DOES need it, and a host without it must fail loudly
+	// rather than silently prune nothing.
+	img := runRetentionOutcome(spec.RetentionRequest{Images: true, DryRun: true}, false)
+	if img.Reply.Error == "" || resolved != 1 {
+		t.Fatalf("an images-only run must resolve the engine and fail on its absence: err=%q resolved=%d",
+			img.Reply.Error, resolved)
 	}
 }
