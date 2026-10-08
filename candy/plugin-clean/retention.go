@@ -10,6 +10,11 @@ package clean
 // peer-dispatch pattern verb:credential/verb:gpu/verb:tunnel use; NO core adapter remains
 // (charly/retention_plugin.go, the former core-side caller, is DELETED — #118).
 //
+// runRetention — the verb:retention entry the peers call — runs every category EXCEPT `scopes`;
+// a peer's post-build/post-run prune has no business stopping a host systemd scope. `scopes` is a
+// CLI-only category, so it travels as an explicit argument rather than on the shared wire request
+// (see retentionOutcome.Scopes).
+//
 // Retention fallback: when defaults.keep_images / keep_check_runs are absent from config,
 // the caller resolves 0 ("disabled") so third-party configs get no surprise pruning. The
 // repo's charly.yml opts in (keep_images: 3, keep_check_runs: 3). See /charly-core:clean.
@@ -21,9 +26,12 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/opencharly/sdk/kit"
 	"github.com/opencharly/spec/cache"
@@ -43,7 +51,7 @@ import (
 // reply — a live-build skip signal is dropped here, because the shared wire type cannot carry it;
 // in-process callers that can REPORT a skip use runRetentionOutcome.
 func runRetention(req spec.RetentionRequest) spec.RetentionReply {
-	return runRetentionOutcome(req).Reply
+	return runRetentionOutcome(req, false).Reply
 }
 
 // retentionOutcome is what ONE engine run decided: the WIRE reply PLUS the live-build skip
@@ -67,15 +75,43 @@ type retentionOutcome struct {
 
 	// DeepSkip is set when the store-wide dangling sweep (the `deep` category) declined.
 	DeepSkip *retentionSkip
+
+	// Scopes is the unit list of the transient build-scope reaper (the `scopes` category): the
+	// scopes it stopped, or would stop under a dry run. It rides HERE, not on spec.RetentionReply,
+	// for the same reason the skip signals do: the reaper is a HOST-HYGIENE surface reached only by
+	// `charly clean`'s own CLI — no peer asks for it over verb:retention (a peer's post-build or
+	// post-run prune must never stop a scope) — and it needs neither the resolved keep-defaults nor
+	// the container engine (see runRetentionOutcome's needsEngine: only the store-touching categories
+	// resolve one). Adding a field to the shared wire type to carry a reply no peer reads would be a
+	// cross-repo change for no consumer.
+	Scopes []string
+
+	// ScopeSkip is set when the scope reaper declined on a guard (a live build, or no user systemd
+	// session), never when it merely found nothing.
+	ScopeSkip *retentionSkip
 }
 
 // runRetentionOutcome runs the requested category(ies) and returns the wire reply plus the
 // live-build skip signal(s) — the form every caller that can REPORT a skip (the plugin's own CLI)
 // uses, so the guard's decision is made once, in the engine, and never re-derived by a caller.
-func runRetentionOutcome(req spec.RetentionRequest) retentionOutcome {
-	engineBin, err := resolveEngineBinary()
-	if err != nil {
-		return retentionOutcome{Reply: spec.RetentionReply{Error: err.Error()}}
+// scopes is the CLI-only transient build-scope category (see retentionOutcome.Scopes); every
+// peer/wire caller passes false.
+func runRetentionOutcome(req spec.RetentionRequest, scopes bool) retentionOutcome {
+	// The engine is resolved ONLY for the categories that touch the container store. Four of them
+	// never do: the scope reaper (systemd + /proc), the check-run sweep and the .build staging sweep
+	// (filesystem), and the cache GC (the CAS blob store). Resolving it up front made every one of
+	// them a hard ERROR on a host with no podman — including `charly clean --scopes`, i.e. the one
+	// category that matters most on a host whose engine is broken, since a hung build scope is a
+	// residue of a build that already failed. Both this file's and the candy description's "needs
+	// neither the engine binary nor the resolved keep-defaults" are therefore true by construction,
+	// not by assertion, and TestScopesOnlyRunNeedsNoEngine pins it.
+	needsEngine := req.Invalidate != "" || req.List || req.BuildPrune || req.Images || req.Deep
+	var engineBin string
+	if needsEngine {
+		var err error
+		if engineBin, err = resolveEngine(); err != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: err.Error()}}
+		}
 	}
 
 	// --invalidate: targeted image-tag invalidation ONLY (matches the CLI's early return).
@@ -158,6 +194,14 @@ func runRetentionOutcome(req spec.RetentionRequest) retentionOutcome {
 		}
 		reply.CacheStores = stores
 	}
+	if scopes {
+		reaped, skip, serr := reapBuildScopes(req.DryRun)
+		if serr != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("reaping transient build scopes: %v", serr)}}
+		}
+		out.Scopes = reaped
+		out.ScopeSkip = skip
+	}
 	return out
 }
 
@@ -194,6 +238,12 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
 
 // resolveEngineBinary resolves the container engine binary via kit.ResolveRuntime — the
 // same resolver every other engine-shelling site uses.
+// resolveEngine is the engine-resolution seam (a package-level var for the same reason
+// liveBuildFloor / listDanglingImages / listBuildScopes are): a test can prove which categories
+// require it without an engine on PATH, which is exactly the property Block A1 asked this cutover
+// to pin rather than assert.
+var resolveEngine = resolveEngineBinary
+
 func resolveEngineBinary() (string, error) {
 	rt, err := kit.ResolveRuntime()
 	if err != nil {
@@ -257,8 +307,34 @@ func imageInUse(im kit.LocalImageInfo, ids, refs map[string]bool) bool {
 	return false
 }
 
-// imageLabelCalVer parses the image's ai.opencharly.version label (the
-// content-derived EffectiveVersion) — the PRIMARY retention ordering key.
+// imageContentIdentity is the ONE identity key retention uses: the image's content identity —
+// the digest the engine reports as the image ID (see normImageID). It answers WHICH artifact a row
+// names, never WHICH one is newer: two rows sharing it are ONE artifact wearing two tags, so
+// `keep_images: N` budgets them once (retentionRanks).
+//
+// It replaces imageLabelCalVer, which read `ai.opencharly.version` as the retention ordering
+// PRIMARY KEY. That label is no longer emitted — the schema-versioning-removal cutover deleted the
+// author-declared aggregated image version it carried (deploykit.ComputeEffectiveVersions and
+// ResolvedBox.Version are gone; sdk/deploykit/write_labels.go writes no ai.opencharly.version) —
+// and the old key was worse than merely dead, because absence is a CUTOVER-BOUNDARY property, not
+// a steady state: on any store spanning that boundary the sort's "labelled row sorts before
+// unlabelled" tiebreak ranked PRE-cutover images above POST-cutover ones REGARDLESS of build time.
+// That is an ordering INVERSION which can select the NEWEST image for removal and keep the oldest
+// (opencharly/plugin-clean#10; the operator measured 202 of 238 local images still carrying a
+// parseable label on 2026-10-03, so the inversion is reachable, not theoretical).
+//
+// Identity is content-addressed here for the same reason the org keys its caches on content
+// (spec/cache's Entry.Components, loaderkit's components digest): it is derived from the artifact,
+// so it cannot drift from what the artifact IS.
+func imageContentIdentity(im kit.LocalImageInfo) string { return normImageID(im.ID) }
+
+// imageLabelCalVer parses the image's `ai.opencharly.version` label. The label is no longer
+// emitted (see imageContentIdentity) and is NOT an ordering key: this read survives ONLY for the
+// `charly box list tags` payload, whose published wire field (spec.TagInfo.Version,
+// spec/schema/clean.cue) is defined as exactly this label and documents "-" when it is absent.
+// Deleting that field is the `spec` repo's half of this sweep (opencharly/plugin-clean#10 names
+// spec/container/box_metadata_coneb.go and spec/schema/resolvedbox.cue); until it lands, do NOT
+// re-wire this into the sort or into the exemption guard — that restores the inversion.
 func imageLabelCalVer(im kit.LocalImageInfo) (kit.CalVer, bool) {
 	return kit.ParseCalVer(im.Labels[spec.LabelVersion])
 }
@@ -267,28 +343,34 @@ func imageLabelCalVer(im kit.LocalImageInfo) (kit.CalVer, bool) {
 // inventory row behind retention pruning, `charly box list tags`, and
 // `charly clean --invalidate`.
 type imageTagInfo struct {
-	Ref         string
-	ID          string
+	Ref string
+	// ID is the row's CONTENT IDENTITY (imageContentIdentity: the image-config digest, i.e. the
+	// engine's image ID). It is the ONE identity key: retentionRanks groups rows by it, so every
+	// tag of one artifact shares one distinct-image rank. It plays NO part in ordering.
+	ID string
+	// LabelCalVer/OkLabel are the `ai.opencharly.version` label — a NEVER-EMITTED key (see
+	// imageContentIdentity) that retention no longer orders or exempts by. They survive only to
+	// populate the published `charly box list tags` version column (spec.TagInfo.Version); do not
+	// reintroduce them into the sort or the exemption guard.
 	LabelCalVer kit.CalVer
 	OkLabel     bool
 	TagCalVer   kit.CalVer
 	OkTag       bool
 	InUse       bool
 	// Created is the image's creation time (unix seconds) — the build-recency key, total over
-	// every tag charly mints. The CalVer keys above are NOT: `charly box build --tag` REPLACES
-	// the CalVer tag, so a bed build carries `check-<bed>-<calver>`, which parses as no CalVer at
-	// all. A group of bed-tagged images therefore had OkTag false for EVERY member, the sort's
-	// final comparator was false for every pair, and the surviving order was whatever
-	// `podman images` happened to emit — so keep_images: N kept an ARBITRARY N and could delete
-	// the newest build while keeping older ones. Unlike the resolver's wrong ANSWER, this one
-	// destroys an artifact.
+	// every tag charly mints, and therefore the ordering's PRIMARY key. The CalVer keys are NOT:
+	// `charly box build --tag` REPLACES the CalVer tag, so a bed build carries
+	// `check-<bed>-<calver>`, which parses as no CalVer at all. A group of bed-tagged images
+	// therefore had OkTag false for EVERY member, the sort's final comparator was false for every
+	// pair, and the surviving order was whatever `podman images` happened to emit — so
+	// keep_images: N kept an ARBITRARY N and could delete the newest build while keeping older
+	// ones. Unlike the resolver's wrong ANSWER, this destroys an artifact.
 	Created int64
 }
 
 // charlyImageTags inventories local storage: one row PER TAG (deduped by
-// ref), grouped by the ai.opencharly.box label and sorted newest-first
-// (label-CalVer primary, CREATION TIME tiebreaker, build-tag CalVer tertiary).
-// Non-charly images (no label) never appear.
+// ref), grouped by the ai.opencharly.box label and sorted newest-first by
+// CREATION TIME (build-tag CalVer tiebreak). Non-charly images (no label) never appear.
 func charlyImageTags(engine string) (map[string][]imageTagInfo, error) {
 	imgs, err := kit.ListLocalImages(engine)
 	if err != nil {
@@ -314,22 +396,20 @@ func charlyImageTags(engine string) (map[string][]imageTagInfo, error) {
 			seenRef[ref] = true
 			tcv, okT := kit.ParseCalVer(kit.ExtractCalVerTag(ref))
 			groups[short] = append(groups[short], imageTagInfo{
-				Ref: ref, ID: normImageID(im.ID), LabelCalVer: lcv, OkLabel: okL,
+				Ref: ref, ID: imageContentIdentity(im), LabelCalVer: lcv, OkLabel: okL,
 				TagCalVer: tcv, OkTag: okT, InUse: inUse, Created: im.Created,
 			})
 		}
 	}
 	for _, group := range groups {
 		sort.SliceStable(group, func(i, j int) bool {
-			if group[i].OkLabel && group[j].OkLabel && group[i].LabelCalVer != group[j].LabelCalVer {
-				return group[j].LabelCalVer.Less(group[i].LabelCalVer) // newer label first
-			}
-			if group[i].OkLabel != group[j].OkLabel {
-				return group[i].OkLabel // labelled sorts before unlabelled
-			}
-			// Creation time before the build tag: it is the only recency key TOTAL over the tags
-			// charly mints, so a group of bed-tagged images orders correctly instead of collapsing
-			// to "whatever podman emitted" (see imageTagInfo.Created).
+			// CREATION TIME is the ordering's primary — and only — recency key, because it is the
+			// one key TOTAL over the tags charly mints (see imageTagInfo.Created). The former
+			// primary key was the `ai.opencharly.version` label, whose absence on post-cutover
+			// images made the "labelled sorts before unlabelled" tiebreak an ordering INVERSION
+			// that could delete the NEWEST image: opencharly/plugin-clean#10. Content identity
+			// (imageContentIdentity) deliberately does NOT order — it decides which rows are one
+			// artifact, which is retentionRanks' job.
 			if group[i].Created != group[j].Created && group[i].Created != 0 && group[j].Created != 0 {
 				return group[i].Created > group[j].Created // newer build first
 			}
@@ -344,7 +424,10 @@ func charlyImageTags(engine string) (map[string][]imageTagInfo, error) {
 
 // flattenTagGroups presents charlyImageTags' grouped inventory as the verb:retention
 // `list` reply payload: boxes sorted alphabetically, tags within each box in the
-// group's existing newest-first order.
+// group's existing newest-first order. Version is the `ai.opencharly.version` label — a key
+// nothing emits any more, so it reads "-" on every current row; it survives because
+// spec.TagInfo.Version's published contract is defined as exactly that label and its removal is
+// the `spec` half of the opencharly/plugin-clean#10 sweep (see imageLabelCalVer).
 func flattenTagGroups(groups map[string][]imageTagInfo) []spec.TagInfo {
 	boxes := make([]string, 0, len(groups))
 	for b := range groups {
@@ -386,6 +469,11 @@ const (
 	// skipReasonStaging: the /var/tmp buildah-podman staging reaper (an in-flight build's
 	// staging dir is LIVE data, not dead weight).
 	skipReasonStaging = "buildah/podman staging of an in-flight build is never swept"
+	// skipReasonScopes: the transient build-scope reaper (a live build's own scope is not hung).
+	skipReasonScopes = "transient build scopes of an in-flight build are never reaped"
+	// skipReasonScopesNoSystemd: the scope reaper found no user systemd session to enumerate
+	// transient scopes in (a headless/container host) — nothing to enumerate, nothing to reap.
+	skipReasonScopesNoSystemd = "no user systemd session to enumerate transient build scopes"
 )
 
 // retentionSkip is a live-build-guarded sweep's DECISION TO DECLINE, carried OUT of the engine so
@@ -404,8 +492,13 @@ type retentionSkip struct {
 }
 
 // String is the user-visible form: the exact line the CLI prints IN PLACE OF the removed count
-// for the skipped category.
+// for the skipped category. The live-build clause is omitted when there is no live build to name
+// (the scope reaper's no-systemd-session case), so the line never claims a build count it did not
+// measure.
 func (s retentionSkip) String() string {
+	if s.live <= 0 {
+		return fmt.Sprintf("SKIPPED — %s", s.reason)
+	}
 	return fmt.Sprintf("SKIPPED — %d build(s) in flight; %s (re-run when builds are idle)", s.live, s.reason)
 }
 
@@ -480,19 +573,18 @@ func retentionRemovable(c imageTagInfo, rank, keepN int, floor kit.CalVer, floor
 	// and is protected when it qualifies. Hoisting the rank check below this one would change
 	// which rows are even considered.
 	//
-	// The guard is an AND, and that bounds it much more tightly than "non-CalVer tags are safe":
-	// a row is undatable only when it has NEITHER a datable ai.opencharly.version label NOR a
-	// datable :YYYY.DDD.HHMM tag. A `:latest` on an image that carries a datable label has
-	// OkLabel == true, so it does NOT qualify and IS reclaimable by tag ordinal. Since the label
-	// is a DECLARED version (deploykit.ComputeEffectiveVersions: the box's version:, else the
-	// highest candy version:, else the base's) rather than a content hash, most charly-built
-	// images carry one — so this exemption protects far fewer rows than its name suggests, and
-	// `latest` on a managed image is not among them. An earlier version of this comment claimed
-	// such a tag "can never be elected for removal however many tags its image wears", which is
-	// the OR reading of an AND guard; the docs prose generated from candy/charly-core stated the
-	// AND correctly while this comment did not.
-	if !c.OkLabel && !c.OkTag {
-		return false // never remove a tag we can't date by EITHER key
+	// There is exactly ONE datable key left, and it is the tag: the `ai.opencharly.version` label
+	// that this guard used to read as a second one is never emitted any more (see
+	// imageContentIdentity), so an AND over two keys would today be an AND with a constant — and,
+	// on a store spanning the cutover, would resurrect exactly the key whose ordering inversion is
+	// opencharly/plugin-clean#10. A row is therefore exempt ONLY when its tag carries no
+	// `:YYYY.DDD.HHMM`, which is the fail-safe direction: `latest`, `dev`, and a bare ref are never
+	// reclaimed, while a `check-<bed>-<calver>` tag (datable by its LABEL position, not by
+	// ExtractCalVerTag) is likewise exempt. Surplus CalVer tag rows — the case keep_images'
+	// tag-ordinal half exists for — remain reclaimable, which is what keeps a content-stable
+	// image's tag rows bounded (TestPruneImagesByRetention_SharedID).
+	if !c.OkTag {
+		return false // never remove a tag we cannot date by the ONE remaining datable key
 	}
 	if c.InUse {
 		return false // image referenced by a container/deploy
@@ -514,8 +606,9 @@ func retentionRemovable(c imageTagInfo, rank, keepN int, floor kit.CalVer, floor
 // retentionRanks maps each tag in a newest-first box group onto the TWO ordinals `keep_images: N`
 // budgets, because one number alone cannot express what retention has to protect:
 //
-//   - imageRank — the rank of the DISTINCT IMAGE the tag names. Every tag of the newest image
-//     ranks 0, every tag of the next distinct image ranks 1, and so on.
+//   - imageRank — the rank of the DISTINCT IMAGE the tag names, where a distinct image is a
+//     distinct CONTENT IDENTITY (imageContentIdentity: the image-config digest). Every tag of the
+//     newest image ranks 0, every tag of the next distinct image ranks 1, and so on.
 //   - tagOrd — the tag's ordinal WITHIN its own image, newest first.
 //
 // A tag survives when BOTH are inside the budget, i.e. `keep_images: N` keeps the newest N
@@ -753,6 +846,258 @@ func pruneBuildahStaging(dryRun bool) ([]string, *retentionSkip) {
 		}
 	}
 	return removed, nil
+}
+
+// --- transient build-scope reaping (the `scopes` category) ----------------------------------
+
+// WHO creates these. `charly box build` (and every image build a bed runs) builds through
+// buildah/podman, which puts each BUILD CONTAINER into its own transient systemd user scope named
+// `<runtime>-<container-name>.scope`; podman names the build container `buildah-<id>`. MEASURED
+// live (RDD spike, 2026-10-07) by building a two-line Containerfile on this host:
+//
+//	$ systemctl --user list-units --type=scope --all --no-legend | grep buildah
+//	runc-buildah-buildah2754860408.scope  loaded active running  libcontainer container buildah-buildah2754860408
+//
+// That family is the COMPLETE list of transient scopes charly can create on a host. Image builds
+// are the only charly operation that starts a transient scope: bed pods and every
+// `charly config`/`start` service are quadlet systemd SERVICES (`charly-*.service`, not scopes),
+// and a nested podman inside a bed pod creates its scopes in the POD's own cgroup namespace,
+// invisible from here. Other software's scopes (`dsh-subprocess-*.scope` from the agent harness,
+// `podman-pause-*.scope` for a paused container) are deliberately NOT in the family: reaping a
+// scope another owner created, and whose lifetime that owner still depends on, is not charly's
+// mandate.
+//
+// WHY reap. A build step that hangs leaves its scope behind FOREVER, because the only thing that
+// would have stopped it — the build's own teardown — died with the builder:
+// opencharly/plugin-clean#11 measured `runc-buildah-buildah986455857.scope` ACTIVE for SEVEN DAYS
+// with 13 tasks inside, a `node ... | xargs npm install -g` step spinning at 309% CPU after its
+// builder parent was gone, taking the host to 12.27 load on 16 cores. Nothing reaped it: the run's
+// metadata was gone with its worktree, so `charly reap-orphans` (a probe over a project's recorded
+// deploy state) could not see it, and `charly clean` had no category for it. Clearing it took a
+// hand `systemctl --user stop` plus `kill -9` of reparented survivors.
+//
+// THE DECISION — pure and testable (selectReapableBuildScopes). A scope is reapable iff ALL of:
+//
+//	1. its unit name is in the build-scope family (buildScopeNameRe);
+//	2. it has been ACTIVE for at least defaultBuildScopeMaxAge — a live build is far shorter, and
+//	   a legitimately long one is additionally protected by rule 3;
+//	3. NO live builder parent exists anywhere on the host (no `buildah`/`podman` process), so no
+//	   build is in flight that could still own it. This is the issue's own rule and it is
+//	   deliberately conservative: it refuses whenever a builder runs at all, including a
+//	   buildah/podman invocation charly did not start.
+//
+// The sweep ADDITIONALLY declines wholesale while charly's own build-activity lock is held
+// (liveBuildFloor), the same guard every other destructive category uses, so a `charly clean`
+// racing another session's build can never touch that build's scope.
+//
+// REAPING is `systemctl --user stop <unit>`: the scope's default KillMode=control-group tears the
+// whole cgroup down, so the hung step and its descendants die with it. MEASURED in the same spike
+// against a real scope of this family whose launcher had exited:
+//
+//	$ systemctl --user stop runc-buildah-buildahSPIKE111.scope   # rc=0
+//	$ systemctl --user show runc-buildah-buildahSPIKE111.scope -p LoadState
+//	LoadState=not-found
+//	$ ls /sys/fs/cgroup/.../runc-buildah-buildahSPIKE111.scope   # No such file or directory
+//	$ ps -p <the surviving sleep pid>                            # gone
+//
+// The unit name is matched, never a PID: a scope's own name is the only handle that survives the
+// builder, and nothing here needs to know which step inside it hung.
+
+// defaultBuildScopeMaxAge is how long a build-family scope may stay ACTIVE with no live builder
+// before it is treated as hung. One hour is an order of magnitude above the longest healthy
+// image build in flight on this host, and the live-builder guard protects the exceptions.
+const defaultBuildScopeMaxAge = time.Hour
+
+// buildScopeNameRe matches the transient scope podman/buildah gives a BUILD container:
+// `<runtime>-buildah-<id>.scope` (measured: runc-buildah-buildah2754860408.scope). The runtime
+// token varies with the configured OCI runtime (runc/crun), so it is matched generically.
+var buildScopeNameRe = regexp.MustCompile(`^[a-z][a-z0-9]*-buildah-.*\.scope$`)
+
+// buildScope is one ACTIVE transient build scope, as enumerated from the user systemd session.
+type buildScope struct {
+	// Unit is the systemd unit name (e.g. runc-buildah-buildah2754860408.scope).
+	Unit string
+	// AgeSeconds is how long the unit has been active, derived from its
+	// ActiveEnterTimestampMonotonic against the kernel's monotonic clock (/proc/uptime) — the same
+	// clock, so no wall-clock or timezone assumption enters the decision.
+	AgeSeconds int64
+}
+
+// Seams — package-level vars for testability, the same pattern liveBuildFloor / listDanglingImages
+// use. A test stubs all three so the reap decision is deterministic without a systemd session, a
+// live engine, or a real scope.
+var (
+	listBuildScopes     = defaultListBuildScopes
+	liveBuilderParents  = defaultLiveBuilderParents
+	stopBuildScope      = defaultStopBuildScope
+	buildScopeMaxAge    = defaultBuildScopeMaxAge
+	userSystemdBusReady = defaultUserSystemdBusReady
+)
+
+// defaultUserSystemdBusReady reports whether a user systemd session exists to enumerate scopes in.
+// Probed by the session's private socket rather than by parsing a systemctl error string.
+func defaultUserSystemdBusReady() bool {
+	run := os.Getenv("XDG_RUNTIME_DIR")
+	if run == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(run, "systemd", "private"))
+	return err == nil
+}
+
+// defaultStopBuildScope is the reap primitive: stop one transient scope. The scope's default
+// KillMode=control-group takes its whole process tree down with it (measured, see above).
+func defaultStopBuildScope(unit string) error {
+	return exec.Command("systemctl", "--user", "stop", unit).Run()
+}
+
+// uptimeSeconds reads the kernel's monotonic clock (/proc/uptime, first field, seconds). The scope
+// ages below are measured against it, so they cannot be skewed by a wall-clock step.
+func uptimeSeconds() (int64, error) {
+	b, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, err
+	}
+	f := strings.Fields(string(b))
+	if len(f) == 0 {
+		return 0, fmt.Errorf("parsing /proc/uptime: no fields")
+	}
+	secs, err := strconv.ParseFloat(f[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("parsing /proc/uptime: %w", err)
+	}
+	return int64(secs), nil
+}
+
+// defaultListBuildScopes enumerates the ACTIVE transient build scopes of the user systemd session.
+// Only active units are returned (an inactive one is not hung, it is already gone), and a unit
+// whose properties cannot be read is reported with AgeSeconds 0 so the age rule REFUSES it —
+// failing closed, never open, on an unreadable scope.
+func defaultListBuildScopes() ([]buildScope, error) {
+	out, err := exec.Command("systemctl", "--user", "list-units", "--type=scope",
+		"--all", "--plain", "--no-legend", "--no-pager").Output()
+	if err != nil {
+		return nil, fmt.Errorf("listing user scopes: %w", err)
+	}
+	uptime, err := uptimeSeconds()
+	if err != nil {
+		return nil, err
+	}
+	var scopes []buildScope
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !buildScopeNameRe.MatchString(fields[0]) {
+			continue
+		}
+		props, perr := exec.Command("systemctl", "--user", "show", fields[0],
+			"-p", "ActiveState", "-p", "ActiveEnterTimestampMonotonic").Output()
+		if perr != nil {
+			scopes = append(scopes, buildScope{Unit: fields[0]})
+			continue
+		}
+		var state string
+		var entered int64
+		for _, pl := range strings.Split(string(props), "\n") {
+			k, v, ok := strings.Cut(strings.TrimSpace(pl), "=")
+			if !ok {
+				continue
+			}
+			switch k {
+			case "ActiveState":
+				state = v
+			case "ActiveEnterTimestampMonotonic":
+				entered, _ = strconv.ParseInt(v, 10, 64)
+			}
+		}
+		if state != "active" {
+			continue
+		}
+		age := uptime - entered/1_000_000
+		if entered == 0 {
+			age = 0 // unreadable activation stamp — refuse rather than assume old
+		}
+		scopes = append(scopes, buildScope{Unit: fields[0], AgeSeconds: age})
+	}
+	return scopes, nil
+}
+
+// defaultLiveBuilderParents reports whether ANY process that can own a build container is alive —
+// a `buildah` or a `podman` CLI process. Read straight from /proc (no pgrep dependency, no shell),
+// so it is cheap and cannot itself hang.
+func defaultLiveBuilderParents() (bool, error) {
+	names := map[string]bool{"buildah": true, "podman": true}
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		return false, fmt.Errorf("scanning /proc for a live builder: %w", err)
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		if _, aerr := strconv.Atoi(e.Name()); aerr != nil {
+			continue
+		}
+		comm, rerr := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
+		if rerr != nil {
+			continue
+		}
+		if names[strings.TrimSpace(string(comm))] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// selectReapableBuildScopes is the PURE reaping decision: from every enumerated scope, the ones a
+// sweep may stop. It is a function of its arguments alone, so the guard can be pinned by a test
+// with no systemd, no /proc scan and no real scope (see TestSelectReapableBuildScopes).
+func selectReapableBuildScopes(scopes []buildScope, maxAgeSeconds int64, liveBuilder bool) []buildScope {
+	if liveBuilder {
+		return nil // a builder is alive — no scope can be proven orphaned
+	}
+	var out []buildScope
+	for _, s := range scopes {
+		if !buildScopeNameRe.MatchString(s.Unit) {
+			continue // not a scope charly's builds create
+		}
+		if s.AgeSeconds < maxAgeSeconds {
+			continue // still young — a healthy build's scope, or too soon to judge
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// reapBuildScopes reaps (or, under dryRun, reports) every hung transient build scope. It returns
+// the reaped/would-reap unit names and — when a guard, never "nothing found", is the reason for an
+// empty result — the skip signal the CLI prints in place of a count.
+func reapBuildScopes(dryRun bool) ([]string, *retentionSkip, error) {
+	if _, _, live := liveBuildFloor(); live > 0 {
+		return nil, &retentionSkip{live: live, reason: skipReasonScopes}, nil
+	}
+	if !userSystemdBusReady() {
+		return nil, &retentionSkip{reason: skipReasonScopesNoSystemd}, nil
+	}
+	scopes, err := listBuildScopes()
+	if err != nil {
+		return nil, nil, err
+	}
+	liveBuilder, err := liveBuilderParents()
+	if err != nil {
+		return nil, nil, err
+	}
+	var reaped []string
+	for _, s := range selectReapableBuildScopes(scopes, int64(buildScopeMaxAge/time.Second), liveBuilder) {
+		if dryRun {
+			reaped = append(reaped, s.Unit)
+			continue
+		}
+		if err := stopBuildScope(s.Unit); err != nil {
+			continue // already gone, or systemd refused — never fatal, never a false claim
+		}
+		reaped = append(reaped, s.Unit)
+	}
+	return reaped, nil, nil
 }
 
 // --- check-run + build-candy staging retention ----------------------------------------------
