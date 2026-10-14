@@ -159,6 +159,17 @@ func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, do
 			lines = append(lines, fmt.Sprintf("cache %s: %d live entry(ies); %s %d unreferenced blob(s) (%s)\n",
 				s.Name, s.Entries, tag, s.RemovedBlobs, kit.HumanBytes(s.RemovedBytes)))
 		}
+		// The retired roots, reported even when there is nothing to remove: "already gone" and
+		// "never existed" are the states a re-run reaches, and a silent omission would read as a
+		// sweep that found nothing to do rather than one with nothing to do.
+		for _, r := range out.RetiredRoots {
+			switch {
+			case !r.Present:
+				lines = append(lines, fmt.Sprintf("cache retired %s: absent at %s (already swept)\n", r.Name, r.Dir))
+			default:
+				lines = append(lines, fmt.Sprintf("cache retired %s: %s %s (%s)\n", r.Name, tag, kit.HumanBytes(r.Bytes), r.Dir))
+			}
+		}
 	}
 	if _, err := fmt.Fprint(w, strings.Join(lines, "")); err != nil {
 		return fmt.Errorf("printing the clean report: %w", err)

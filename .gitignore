@@ -1,0 +1,3 @@
+# `charly check run` writes its run evidence under .check/<bed>/<calver>/; it is generated
+# evidence, never committed (the umbrella ignores the same path for the same reason).
+.check/
