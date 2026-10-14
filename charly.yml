@@ -89,16 +89,31 @@ check-clean-cache-roots:
                     echo live > "$CR/registry/blobs/sha256/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                     LOG="$PWD/.check/clean-retired-roots.log"; mkdir -p "$(dirname "$LOG")"
                     arms() {
+                    # NAME the binary under test and its version inside the evidence: a step that
+                    # measured a DIFFERENT charly would otherwise fail with a confusing symptom (the
+                    # arm's own assertion firing) instead of naming the cause (charly#911's family).
+                    echo "== the binary under test is ${CHARLY_BIN}"
+                    echo "== its version: $(${CHARLY_BIN} version 2>/dev/null | tail -1)"
                     echo "== store root = $CR (a temp root; CHARLY_CACHE_DIR is the one override)"
                     echo "== ARM 1: --cache --dry-run REPORTS and removes nothing"
-                    ${CHARLY_BIN} clean --cache --dry-run 2>&1 | grep -Ev '^(WARNING|plugin )'
+                    ${CHARLY_BIN} clean --cache --dry-run 2>&1 | grep -Ev '^plugin '
                     [ -d "$CR/images" ] || { echo "the dry run REMOVED the retired root"; exit 1; }
                     echo "== ARM 2: --cache REMOVES it and leaves the live store alone"
-                    ${CHARLY_BIN} clean --cache 2>&1 | grep -Ev '^(WARNING|plugin )'
+                    ${CHARLY_BIN} clean --cache 2>&1 | grep -Ev '^plugin '
                     [ -d "$CR/images" ] && { echo "the real run left the retired root"; exit 1; }
                     [ -f "$CR/registry/index.json" ] || { echo "the sweep took the LIVE store with it"; exit 1; }
                     echo "== ARM 3: a re-run is a no-op, not an error"
-                    ${CHARLY_BIN} clean --cache --dry-run 2>&1 | grep -Ev '^(WARNING|plugin )'
+                    ${CHARLY_BIN} clean --cache --dry-run 2>&1 | grep -Ev '^plugin '
+                    # R1/R10 "zero (new) warnings" as a CHECKED property of this log rather than a
+                    # claim about it: the ONLY warning this venue emits is the dev/worktree banner (an
+                    # environment artifact, not the changed path's), so anything else fails the step.
+                    if grep -q '^WARNING' "$LOG"; then
+                      unexpected=$(grep '^WARNING' "$LOG" | grep -vc '^WARNING: charly is a dev/worktree build' || true)
+                      [ "$unexpected" = "0" ] || { echo "the changed path emitted $unexpected unexpected warning(s)"; grep '^WARNING' "$LOG"; exit 1; }
+                      echo "== warnings present: $(grep -c '^WARNING' "$LOG"), ALL the dev/worktree banner (environment, not the changed path)"
+                    else
+                      echo "== warnings present: 0"
+                    fi
                     echo "== RETIRED-ROOT-OK"
                     rm -rf "$CR"
                     }
