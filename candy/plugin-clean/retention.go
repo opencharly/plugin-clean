@@ -352,7 +352,12 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
 }
 
 // resolveEngineBinary resolves the container engine binary via kit.ResolveRuntime — the
-// same resolver every other engine-shelling site uses.
+// same resolver every other engine-shelling site uses. It is the RUN engine
+// (`rt.RunEngine`): every caller shells it against the engine's own image/container
+// store (`ps`, `images`, `rmi`, the build-scope reaper), which is the store the run
+// engine owns. The retired `engine.build` selector — and `rt.BuildEngine` with it —
+// went with the BuildKit cutover (opencharly/opencharly#481), where BuildKit became
+// the ONE image builder and the builder stopped being a separately selectable engine.
 // resolveEngine is the engine-resolution seam (a package-level var for the same reason
 // liveBuildFloor / listDanglingImages / listBuildScopes are): a test can prove which categories
 // require it without an engine on PATH, which is exactly the property Block A1 asked this cutover
@@ -364,7 +369,7 @@ func resolveEngineBinary() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return kit.EngineBinary(rt.BuildEngine), nil
+	return kit.EngineBinary(rt.RunEngine), nil
 }
 
 // --- image-tag inventory (charlyImageTags + support) -------------------------------------

@@ -341,3 +341,25 @@ func TestScopesOnlyRunNeedsNoEngine(t *testing.T) {
 			img.Reply.Error, resolved)
 	}
 }
+
+// TestResolveEngineBinaryUsesTheRunEngine pins WHICH engine this seam resolves, because every
+// caller shells the returned binary against the RUN engine's own store — `ps -a` for the
+// referenced-image guard, `images` for the dangling sweep, `rmi` for both, and the build-scope
+// reaper's `systemctl --user` fallback. So it must follow `engine.run`.
+//
+// It is the coverage for the BuildKit cutover's `spec` change: `hostenv` DELETED
+// `ResolvedRuntime.BuildEngine` (and `EngineConfig.Build`) — the image builder stopped being a
+// separately selectable engine (opencharly/opencharly#481, scope ruling "the image BUILDER
+// only"). This test FAILS if the seam goes back to a build-engine selector: with only
+// `CHARLY_RUN_ENGINE` set and no build-engine variable, a build-engine read would leave the
+// binary unresolved ("auto" -> detection) instead of docker.
+func TestResolveEngineBinaryUsesTheRunEngine(t *testing.T) {
+	t.Setenv("CHARLY_RUN_ENGINE", "docker")
+	got, err := resolveEngineBinary()
+	if err != nil {
+		t.Fatalf("resolveEngineBinary: %v", err)
+	}
+	if got != "docker" {
+		t.Errorf("resolveEngineBinary() = %q, want the RUN engine's binary %q (CHARLY_RUN_ENGINE)", got, "docker")
+	}
+}
