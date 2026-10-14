@@ -11,3 +11,118 @@
 discover:
     - path: candy
       recursive: true
+
+# ---------------------------------------------------------------------------
+# THE R10 BED for the `charly clean` command surface.
+#
+# SHAPE (the plugin-cache#9 / charly-registry#10 precedent): a `kind:local` TEMPLATE that installs
+# nothing (`candy: []` is required there) and carries NO plan — a template's `plan:` is not carried
+# into the composed deploy, so checks declared there silently never run — plus a `disposable: true`
+# DEPLOY that composes it and carries the `plan:`.
+#
+# THE BINARY IS `${CHARLY_BIN}`, BRACED, and named in each step's own evidence: a bare `charly`
+# resolves from the step's PATH and can measure a STALE install (R9), and the runner substitutes the
+# BRACED spelling only (the unbraced form is unbound under `set -u`).
+#
+# WHY THIS REPO HAS ITS OWN BED: `AGENTS.md` names charly's `check-commands-local` as the org-level
+# witness for the externalized commands, and that bed is the right witness for the EXTERNALIZATION.
+# It is not affordable as a per-change gate: measured, its own `deploy-add` host-builds the five
+# plugins it composes (10m04s on this host) and its `check-live` had completed no step after another
+# 10 minutes. This bed is the plugin's OWN change-class gate — same idiom, seconds to run, and the
+# `--dry-run` arms touch nothing.
+#
+# The steps drive the RETIRED-ROOT instrument (opencharly/charly-registry#11): a temp cache root is
+# populated with the retired root's real shape (`<cache>/images/sha256/<hex>`, which carries no
+# `oci-layout` marker — the measurement that made a declared retirement, not a layout discovery, the
+# right instrument for it), then the three arms are asserted: a dry run REPORTS and removes nothing,
+# a real run removes it and leaves a live sibling store alone, and a re-run reports it ABSENT.
+# ---------------------------------------------------------------------------
+clean-cmd-check:
+    local:
+        description: |-
+            Minimal kind:local template for the clean-command bed: installs nothing (`candy: []` is
+            required on a kind:local template) and carries no plan — the checks live on the deploy
+            that composes it.
+        candy: []
+
+check-clean-cache-roots:
+    local:
+        from: clean-cmd-check
+        host: local
+        disposable: true
+        lifecycle: test
+        plan:
+            - check: the `charly clean` command grammar resolves in the ACTIVE binary
+              id: cc-grammar-resolves
+              context: [runtime]
+              timeout: 120s
+              exit_status: 0
+              command:
+                in_container: false
+                command: |
+                    set -eu
+                    echo "the binary under test is ${CHARLY_BIN}"
+                    ${CHARLY_BIN} clean --help >/dev/null
+                    echo "clean --help resolves"
+            - check: >-
+                  the `cache` category retires the DECLARED retired root: a dry run reports it and removes
+                  nothing, a real run removes it and leaves a live sibling store alone, and a re-run reports
+                  it absent
+              id: cc-retired-root-sweep
+              context: [runtime]
+              timeout: 600s
+              exit_status: 0
+              stdout:
+                contains: RETIRED-ROOT-OK
+              command:
+                in_container: false
+                command: |
+                    set -eu
+                    CR=$(mktemp -d)
+                    export CHARLY_CACHE_DIR="$CR"
+                    # The retired root's REAL shape: a content-addressed blob store, no oci-layout anywhere.
+                    mkdir -p "$CR/images/sha256"
+                    head -c 4096 /dev/urandom > "$CR/images/sha256/16333ee0c00fc65e025a2a4f839703ad37a74728832977fbdf080984de1b8e5a"
+                    # A LIVE sibling: the shared named store's own shape, which must survive.
+                    mkdir -p "$CR/registry/blobs/sha256"
+                    echo '{"schemaVersion":2,"manifests":[]}' > "$CR/registry/index.json"
+                    echo live > "$CR/registry/blobs/sha256/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    LOG="$PWD/.check/clean-retired-roots.log"; mkdir -p "$(dirname "$LOG")"
+                    arms() {
+                    # NAME the binary under test and its version inside the evidence: a step that
+                    # measured a DIFFERENT charly would otherwise fail with a confusing symptom (the
+                    # arm's own assertion firing) instead of naming the cause (charly#911's family).
+                    echo "== the binary under test is ${CHARLY_BIN}"
+                    echo "== its version: $(${CHARLY_BIN} version 2>/dev/null | tail -1)"
+                    echo "== store root = $CR (a temp root; CHARLY_CACHE_DIR is the one override)"
+                    echo "== ARM 1: --cache --dry-run REPORTS and removes nothing"
+                    ${CHARLY_BIN} clean --cache --dry-run 2>&1 | grep -Ev '^plugin '
+                    [ -d "$CR/images" ] || { echo "the dry run REMOVED the retired root"; exit 1; }
+                    echo "== ARM 2: --cache REMOVES it and leaves the live store alone"
+                    ${CHARLY_BIN} clean --cache 2>&1 | grep -Ev '^plugin '
+                    [ -d "$CR/images" ] && { echo "the real run left the retired root"; exit 1; }
+                    [ -f "$CR/registry/index.json" ] || { echo "the sweep took the LIVE store with it"; exit 1; }
+                    echo "== ARM 3: a re-run is a no-op, not an error"
+                    ${CHARLY_BIN} clean --cache --dry-run 2>&1 | grep -Ev '^plugin '
+                    # R1/R10 "zero (new) warnings" as a CHECKED property of this log rather than a
+                    # claim about it: the ONLY warning this venue emits is the dev/worktree banner (an
+                    # environment artifact, not the changed path's), so anything else fails the step.
+                    if grep -q '^WARNING' "$LOG"; then
+                      unexpected=$(grep '^WARNING' "$LOG" | grep -vc '^WARNING: charly is a dev/worktree build' || true)
+                      [ "$unexpected" = "0" ] || { echo "the changed path emitted $unexpected unexpected warning(s)"; grep '^WARNING' "$LOG"; exit 1; }
+                      echo "== warnings present: $(grep -c '^WARNING' "$LOG"), ALL the dev/worktree banner (environment, not the changed path)"
+                    else
+                      echo "== warnings present: 0"
+                    fi
+                    echo "== RETIRED-ROOT-OK"
+                    rm -rf "$CR"
+                    }
+                    if arms >"$LOG" 2>&1; then :; else rc=$?; cat "$LOG"; exit $rc; fi
+                    for marker in "ARM 1: --cache --dry-run" "the dry run REMOVED" "would remove" "ARM 2: --cache REMOVES" "removed" "the real run left" "ARM 3: a re-run" "already swept" "RETIRED-ROOT-OK"; do
+                      case "$marker" in
+                        "the dry run REMOVED"|"the real run left") continue ;;
+                      esac
+                      grep -q -- "$marker" "$LOG" || { echo "the arm marker did not reach the log: $marker"; cat "$LOG"; exit 1; }
+                    done
+                    cat "$LOG"
+                    echo RETIRED-ROOT-OK

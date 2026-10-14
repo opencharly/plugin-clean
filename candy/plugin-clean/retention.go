@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/opencharly/sdk/kit"
+	"github.com/opencharly/sdk/storekit"
 	"github.com/opencharly/spec/cache"
 	"github.com/opencharly/spec/spec"
 )
@@ -75,6 +76,12 @@ type retentionOutcome struct {
 
 	// DeepSkip is set when the store-wide dangling sweep (the `deep` category) declined.
 	DeepSkip *retentionSkip
+
+	// RetiredRoots is the retired-cache-root sweep (the `cache` category): one entry per cache root
+	// the migration RECORD retires, reported (dry run) or removed. It is a LOCAL field rather than a
+	// wire one on purpose — `spec.RetentionReply` is a contract type owned by `spec`, and a sweep of
+	// this repo's own retired roots does not belong on a reply every peer plugin decodes.
+	RetiredRoots []retiredRootOutcome
 
 	// Scopes is the unit list of the transient build-scope reaper (the `scopes` category): the
 	// scopes it stopped, or would stop under a dry run. It rides HERE, not on spec.RetentionReply,
@@ -193,6 +200,15 @@ func runRetentionOutcome(req spec.RetentionRequest, scopes bool) retentionOutcom
 			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("GCing the cache stores: %v", cerr)}}
 		}
 		reply.CacheStores = stores
+		// The SAME category, the OTHER instrument: GC reclaims unreferenced blobs inside live
+		// stores; this retires whole roots the migration record has retired (opencharly/
+		// charly-registry#11). One category, because an operator asking what the cache holds is
+		// asking about both.
+		retired, rerr := sweepRetiredCacheRoots(req.DryRun)
+		if rerr != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("sweeping the retired cache roots: %v", rerr)}}
+		}
+		out.RetiredRoots = retired
 	}
 	if scopes {
 		reaped, skip, serr := reapBuildScopes(req.DryRun)
@@ -203,6 +219,105 @@ func runRetentionOutcome(req spec.RetentionRequest, scopes bool) retentionOutcom
 		out.ScopeSkip = skip
 	}
 	return out
+}
+
+// retiredCacheRoot is ONE cache root the migration RECORD retires: a single path element under the
+// ONE cache root, WHY it is retired, and where its content went.
+//
+// This is the honest second instrument of the orphan-sweep ruling (opencharly/charly-registry#11).
+// `storekit.OrphanedLayouts` DISCOVERS layout trees by the marker `NamedStores()` tests for, and
+// that is the right mechanism for a root whose children are layouts. A retired BLOB STORE is a
+// different shape — measured: `~/.cache/charly/images` is `images/sha256/<hex>` with ZERO
+// `oci-layout` files, so the discovery mechanism correctly finds nothing there. Deciding that such
+// a root is retired is POLICY, and policy belongs in a declared record, not in a widened predicate
+// (a predicate that swallowed retired roots would be policy wearing a mechanism's name).
+type retiredCacheRoot struct {
+	// Name is the single path element under the cache root (validated by storekit.StoreDir, so it
+	// can never escape the root).
+	Name string
+	// Reason is why this root is retired: what wrote it and what replaced it.
+	Reason string
+	// Migration is where the content went, so a reader of the report can re-fetch rather than
+	// wonder. It names the SURFACE, not a command the sweep runs.
+	Migration string
+}
+
+// retiredCacheRoots is the ONE record of retired cache roots. Adding an entry is the whole
+// procedure for retiring another root: this list is the record, the report is its evidence, and
+// nothing in the mechanism has to learn a new shape.
+func retiredCacheRoots() []retiredCacheRoot {
+	return []retiredCacheRoot{{
+		Name: "images",
+		Reason: "the pre-rename image blob store (`<cache>/images/sha256/<hex>`), retired when `charly images` " +
+			"became `charly registry`; superseded by the shared named store, which keys content by the full ref",
+		Migration: "re-ingest with `charly cache ingest <ref>` (opencharly/plugin-cache); the content lands in the " +
+			"shared named store `<cache root>/registry`",
+	}}
+}
+
+// retiredRootOutcome is ONE retired root's report line: where it is, how much a removal reclaimed or
+// would reclaim, and whether the sweep removed it (never under --dry-run).
+type retiredRootOutcome struct {
+	Name      string
+	Dir       string
+	Bytes     int64
+	Present   bool
+	Removed   bool
+	Reason    string
+	Migration string
+}
+
+// sweepRetiredCacheRoots applies the retirement record with the same report-then-remove idiom the
+// rest of this category uses: under dryRun it sizes each retired root and removes nothing, and only
+// a real run removes it. A root that is already gone is reported as absent rather than as an error —
+// the state a sweep is FOR is the state it leaves behind, so re-running it is a no-op.
+//
+// The path is resolved through storekit.StoreDir, the ONE resolver: it validates the name as a
+// single path element (a retired root can never escape the cache root) and honours
+// CHARLY_CACHE_DIR/XDG_CACHE_HOME, so the sweep acts on the same root every other cache surface
+// reads.
+func sweepRetiredCacheRoots(dryRun bool) ([]retiredRootOutcome, error) {
+	out := make([]retiredRootOutcome, 0, len(retiredCacheRoots()))
+	for _, root := range retiredCacheRoots() {
+		dir, err := storekit.StoreDir(root.Name)
+		if err != nil {
+			return nil, fmt.Errorf("retired cache root %q: %w", root.Name, err)
+		}
+		entry := retiredRootOutcome{
+			Name:      root.Name,
+			Dir:       dir,
+			Reason:    root.Reason,
+			Migration: root.Migration,
+		}
+		if _, serr := os.Stat(dir); serr != nil {
+			out = append(out, entry)
+			continue
+		}
+		entry.Present = true
+		entry.Bytes = treeBytes(dir)
+		if !dryRun {
+			if rerr := os.RemoveAll(dir); rerr != nil {
+				return nil, fmt.Errorf("removing retired cache root %s: %w", dir, rerr)
+			}
+			entry.Removed = true
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+// treeBytes sums every file under dir. A walk error is skipped rather than fatal: this is a SIZE for
+// a report, and the removal itself is where a real failure must surface.
+func treeBytes(dir string) int64 {
+	var total int64
+	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
 }
 
 // gcCacheStores reclaims unreferenced blobs from EVERY named `spec/cache`
