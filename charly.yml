@@ -65,6 +65,39 @@ check-clean-cache-roots:
                     ${CHARLY_BIN} clean --help >/dev/null
                     echo "clean --help resolves"
             - check: >-
+                  the image-tag inventory resolves its CONTAINER ENGINE binary live — the repointed path
+                  (the RUN engine), not the retired build-engine field
+              id: cc-images-engine-resolves
+              context: [runtime]
+              timeout: 300s
+              exit_status: 0
+              stdout:
+                contains: IMAGES-ENGINE-OK
+              command:
+                in_container: false
+                command: |
+                    set -eu
+                    LOG="$PWD/.check/clean-images-engine.log"; mkdir -p "$(dirname "$LOG")"
+                    arms() {
+                    echo "== the binary under test is ${CHARLY_BIN} ($(${CHARLY_BIN} version 2>/dev/null | tail -1))"
+                    # The command's OWN status, never a pipeline's: `clean --images` calls
+                    # resolveEngine() first, so a resolution failure surfaces as a non-zero exit here.
+                    ${CHARLY_BIN} clean --images --dry-run > "$LOG.raw" 2>&1; rc=$?
+                    grep -Ev '^plugin ' "$LOG.raw" || true
+                    echo "== clean --images --dry-run rc=$rc"
+                    [ "$rc" = "0" ] || { echo "the images category failed ($rc) — the engine resolution is the first thing it does"; cat "$LOG.raw"; exit 1; }
+                    echo "== IMAGES-ENGINE-OK"
+                    }
+                    if arms >"$LOG" 2>&1; then :; else rc=$?; cat "$LOG"; exit $rc; fi
+                    grep -q '^images: would remove' "$LOG" || { echo "the tag inventory did not report"; cat "$LOG"; exit 1; }
+                    grep -q 'clean --images --dry-run rc=0' "$LOG" || { echo "the command's own exit status is not in the evidence"; cat "$LOG"; exit 1; }
+                    if grep -q '^WARNING' "$LOG"; then
+                      unexpected=$(grep '^WARNING' "$LOG" | grep -vc '^WARNING: charly is a dev/worktree build' || true)
+                      [ "$unexpected" = "0" ] || { echo "the changed path emitted $unexpected unexpected warning(s)"; grep '^WARNING' "$LOG"; exit 1; }
+                    fi
+                    cat "$LOG"
+                    echo IMAGES-ENGINE-OK
+            - check: >-
                   the `cache` category retires the DECLARED retired root: a dry run reports it and removes
                   nothing, a real run removes it and leaves a live sibling store alone, and a re-run reports
                   it absent

@@ -351,6 +351,31 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
 	return out, nil
 }
 
+// resolveEngineName names the CONTAINER ENGINE this plugin shells for its image-tag inventory,
+// and it is the whole decision this change carries: it reads the RUN engine.
+//
+// It used to read `rt.BuildEngine` — the IMAGE BUILDER — which was wrong twice over once the
+// builder became BuildKit (opencharly/opencharly#481, operator scope: the image BUILDER only):
+// BuildKit is not a container engine at all, so the field could not name a binary that runs
+// containers. What the prune path needs is an engine that RUNS containers, and `engine.run` is
+// where charly names one — the same resolution the SDK's own siblings make
+// (sdk/deploykit/box_ref.go:206 and container_resolve.go:37: `kit.EngineBinary(rt.RunEngine)`).
+// So this is a REPOINT rather than a retirement: `engine.build` has no successor, but this
+// CONSUMER's need does — it was always the run engine's job.
+//
+// Split from the binary mapping on purpose, so the decision is testable in its own right: naming
+// the engine and resolving its path have different failure modes (a wrong engine name is a defect
+// here; a path that cannot be resolved is the host's), and `kit.EngineBinary` FALLS BACK to the
+// default engine when the engine op fails, which would hide a wrong name from any test that only
+// compared binaries.
+func resolveEngineName() (string, error) {
+	rt, err := kit.ResolveRuntime()
+	if err != nil {
+		return "", err
+	}
+	return rt.RunEngine, nil
+}
+
 // resolveEngineBinary resolves the container engine binary via kit.ResolveRuntime — the
 // same resolver every other engine-shelling site uses.
 // resolveEngine is the engine-resolution seam (a package-level var for the same reason
@@ -360,11 +385,11 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
 var resolveEngine = resolveEngineBinary
 
 func resolveEngineBinary() (string, error) {
-	rt, err := kit.ResolveRuntime()
+	name, err := resolveEngineName()
 	if err != nil {
 		return "", err
 	}
-	return kit.EngineBinary(rt.BuildEngine), nil
+	return kit.EngineBinary(name), nil
 }
 
 // --- image-tag inventory (charlyImageTags + support) -------------------------------------
