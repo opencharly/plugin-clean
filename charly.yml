@@ -80,7 +80,6 @@ check-clean-cache-roots:
                     LOG="$PWD/.check/clean-images-engine.log"; mkdir -p "$(dirname "$LOG")"
                     arms() {
                     echo "== the binary under test is ${CHARLY_BIN} ($(${CHARLY_BIN} version 2>/dev/null | tail -1))"
-                    echo "== the RUN engine this host resolves: ${CHARLY_RUN_ENGINE:-auto}"
                     # The command's OWN status, never a pipeline's: `clean --images` calls
                     # resolveEngine() first, so a resolution failure surfaces as a non-zero exit here.
                     ${CHARLY_BIN} clean --images --dry-run > "$LOG.raw" 2>&1; rc=$?
