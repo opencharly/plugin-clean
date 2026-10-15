@@ -1502,9 +1502,13 @@ func removeOldestByMtime(dir string, keepN int, dryRun bool) []string {
 // versions PER CANDY — the build-staging counterpart to image-tag retention, so
 // outdated candy CalVer stagings don't accumulate (candy names are dot-free, so
 // the version parses off the first dot). It also removes the LEGACY shared
-// .build/_layers/ dir (fully superseded by the versioned _candy layout) — that
-// cleanup is unconditional, like the makepkg sweep. keepN<=0 disables only the
-// per-candy retention.
+// .build/_layers/ dir (fully superseded by the versioned _candy layout), and that
+// cleanup deliberately does NOT consult keepN: a superseded layout cannot be
+// retained by a COUNT, because there is nothing left to keep. keepN<=0 disables
+// only the per-candy retention, which is why the legacy removal sits above the
+// early return. (This paragraph used to justify the unconditional removal by
+// analogy to "the makepkg sweep" — a sweep this module no longer performs, and
+// whose only surviving mention was this line.)
 func pruneBuildCandyDirs(buildDir string, keepN int, dryRun bool) []string {
 	var removed []string
 
