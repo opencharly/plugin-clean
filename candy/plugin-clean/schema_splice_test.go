@@ -45,7 +45,12 @@ func TestServedSchemaSplicesOntoBase(t *testing.T) {
 	if def.Err() != nil {
 		t.Fatalf("base ++ plugin does not define #CleanPlugin: %v", def.Err())
 	}
-	if _, err := def.Struct(); err != nil {
+	// Fields() rather than the deprecated Struct(): both answer "is this a struct and not,
+	// say, an incomplete value or a disjunction", and this assertion reads only the error,
+	// so the returned value is discarded exactly as the Struct was. Staticcheck's SA1019
+	// flagged the old call, and R1 says a warning that reddens this change's gate is fixed
+	// in the change, whoever introduced it.
+	if _, err := def.Fields(); err != nil {
 		t.Fatalf("#CleanPlugin is not a struct after the splice: %v", err)
 	}
 }

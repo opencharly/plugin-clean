@@ -320,21 +320,50 @@ func treeBytes(dir string) int64 {
 	return total
 }
 
-// gcCacheStores reclaims unreferenced blobs from EVERY named `spec/cache`
-// ArtifactStore under the cache root (the `cache` category, `charly clean
-// --cache`). A replaced/deleted ArtifactStore entry leaves its superseded blobs
-// behind (content addressing means a new key is a NEW manifest + blobs); each
-// store's own GC reclaims them, bounded to its own entry cap. No live-build
-// guard is needed here — this touches only the CAS blob store, never the podman
-// image store the guard protects. An empty/absent cache root is an empty list,
-// never an error. Read-only under dry_run (GCStats computes the same set without
-// removing).
+// gcCacheStores reclaims unreferenced blobs from EVERY named ArtifactStore this
+// host has, under BOTH cache roots — the `cache` category, `charly clean
+// --cache`.
+//
+// # TWO ROOTS, TWO STORES, and why one loop was not enough
+//
+// There are two independent content-addressed stores on a host, and they are
+// rooted in different places:
+//
+//	spec/cache  -> the CONFIG root (`$CHARLY_CONFIG_DIR`-adjacent), reached by
+//	                cache.NamedStores() and swept by each layout's own GCStats.
+//	storekit    -> the CACHE root (`$CHARLY_CACHE_DIR` else ~/.cache/charly),
+//	                reached by storekit.NamedStores() and swept by the reclaim
+//	                surface added in opencharly/sdk#416.
+//
+// This function used to reach only the first, so a store the one-store migration
+// writes was invisible to the sweep: measured on this host, `charly clean --cache`
+// reclaimed 5 664 blobs (~106 MiB) from the config root and NOTHING from the cache
+// root, while `storekit.NamedStores()` over that same cache root listed stores that
+// `cache.NamedStores()` could not see. That is opencharly/plugin-clean#14.
+//
+// # Why this is two loops rather than one
+//
+// The two halves cannot share a loop, and the reason is not stylistic: they sweep
+// through DIFFERENT primitives. `spec/cache` owns a `GCStats` that computes and
+// removes in one call; `storekit` deliberately splits discovery from removal
+// (`UnreferencedBlobs` names candidates, `RemoveBlob` takes one) so a caller's
+// destructive half stays with the surface that also reports it. Forcing one loop
+// over both would mean a branch on the store's type inside it — a shared shape that
+// hides the difference instead of expressing it. They share the RESULT type
+// (`spec.CacheStoreInfo`) and the report, which is the contract that matters.
+//
+// No live-build guard is needed here — both halves touch only a CAS blob store,
+// never the podman image store the guard protects. An empty or absent root is an
+// empty list, never an error. Read-only under dryRun: the config half computes the
+// same set without removing, and the cache half lists without calling RemoveBlob.
 func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
+	var out []spec.CacheStoreInfo
+
+	// HALF ONE — the CONFIG-rooted `spec/cache` stores.
 	names, err := cache.NamedStores()
 	if err != nil {
 		return nil, err
 	}
-	var out []spec.CacheStoreInfo
 	for _, name := range names {
 		l := cache.OpenNamedLayout(name)
 		reclaim, gerr := l.GCStats(dryRun)
@@ -348,7 +377,97 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
 			RemovedBytes: reclaim.RemovedBytes,
 		})
 	}
+
+	// HALF TWO — the CACHE-rooted `storekit` stores, the ones the one-store
+	// migration writes and the first loop could not see.
+	//
+	// # The roots can COINCIDE, and when they do this half must not run
+	//
+	// The two resolvers do NOT disagree about the override, which makes them
+	// coincide whenever it is set:
+	//
+	//	spec/cache  StoreRoot():  $CHARLY_CACHE_DIR  else  ~/.config/charly/cache/
+	//	storekit    CacheDir():   $CHARLY_CACHE_DIR  else  ~/.cache/charly
+	//
+	// With CHARLY_CACHE_DIR set, BOTH roots are that one directory — so a second
+	// loop would enumerate the same layouts the first already swept, count them
+	// twice, and, on a real run, hand storekit a `spec/cache` layout to delete from.
+	// Measured: the first draft of this change did exactly that, and the existing
+	// test failed naming stores it had never created.
+	//
+	// With the override UNSET the roots genuinely differ — ~/.config/charly/cache
+	// against ~/.cache/charly — and that is the live-host case this change exists
+	// for: `charly clean --cache` reached the config root while `storekit
+	// .NamedStores()` over the cache root reported stores `spec/cache` could not
+	// see (opencharly/plugin-clean#14).
+	//
+	// So the skip is not a special case for tests; it is the rule that the two
+	// halves must partition the stores rather than overlap. Comparing the RESOLVED
+	// roots, not the environment variable, keeps it true if either resolver changes.
+	if sameStoreRoot() {
+		return out, nil
+	}
+	skNames, err := storekit.NamedStores()
+	if err != nil {
+		return nil, fmt.Errorf("storekit stores: %w", err)
+	}
+	for _, name := range skNames {
+		s, oerr := storekit.OpenStore(name)
+		if oerr != nil {
+			return nil, fmt.Errorf("store %q: %w", name, oerr)
+		}
+		entries, eerr := s.Entries()
+		if eerr != nil {
+			return nil, fmt.Errorf("store %q: %w", name, eerr)
+		}
+		cands, cerr := s.UnreferencedBlobs()
+		if cerr != nil {
+			return nil, fmt.Errorf("store %q: %w", name, cerr)
+		}
+		info := spec.CacheStoreInfo{
+			Name:         name,
+			Entries:      int64(len(entries)),
+			RemovedBytes: storekit.BlobBytes(cands),
+		}
+		for _, c := range cands {
+			// The report counts what the sweep RECLAIMED on a real run and what it
+			// WOULD reclaim on a dry one, exactly as the config half's GCStats does
+			// — so `--dry-run` and the real run agree on the number, which is the
+			// property that makes the dry run worth trusting.
+			if !dryRun {
+				if rerr := s.RemoveBlob(c.Digest); rerr != nil {
+					return nil, fmt.Errorf("store %q: remove %s: %w", name, c.Digest, rerr)
+				}
+			}
+			info.RemovedBlobs++
+		}
+		out = append(out, info)
+	}
+
 	return out, nil
+}
+
+// sameStoreRoot reports whether `spec/cache` and `storekit` resolve to the SAME
+// directory, in which case the two halves of gcCacheStores would sweep one set of
+// stores twice.
+//
+// It compares the RESOLVED paths rather than reading CHARLY_CACHE_DIR, because the
+// thing that matters is where the two resolvers actually point, not which
+// environment variable happens to be set: a future resolver change that aligned the
+// two defaults would make the overlap real without any env var involved. A resolver
+// error is reported as NOT the same root — the caller's first half has already
+// failed loudly on the same resolver by then, so returning false here cannot hide a
+// broken root behind a skip.
+func sameStoreRoot() bool {
+	a, err := cache.StoreRoot()
+	if err != nil {
+		return false
+	}
+	b, err := storekit.CacheDir()
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 // resolveEngineName names the CONTAINER ENGINE this plugin shells for its image-tag inventory,

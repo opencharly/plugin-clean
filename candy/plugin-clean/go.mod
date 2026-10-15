@@ -2,7 +2,7 @@ module github.com/opencharly/plugin-clean/candy/plugin-clean
 
 go 1.26.4
 
-require github.com/opencharly/sdk v0.2026287.2213
+require github.com/opencharly/sdk v0.2026288.2236
 
 require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
