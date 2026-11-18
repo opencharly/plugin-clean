@@ -13,7 +13,7 @@ description: |-
 the on-demand counterpart to the auto-pruning that runs after `charly box build`
 and `charly check run`.
 
-`charly clean` is a **compiled-in COMMAND-class plugin** (`candy/plugin-clean`, `command:clean`) that OWNS the command AND (K1-alpha core-minimization) the **shared retention ENGINE** itself — `pruneImagesByRetention`, `pruneCheckRuns`, `pruneBuildCandyDirs`, `invalidateImageTags`, `pruneDeepDanglingImages`, and the charly-labeled image-tag CalVer/label inventory (`candy/plugin-clean/retention.go`), relocated from the former `charly/retention.go` since it has zero core-only dependencies (`kit.CalVer`/`kit.ListLocalImages`/`kit.BuildActivityDir` are all sdk-portable). The plugin owns the flag grammar (`--dry-run` / `--images` / `--check` / `--deep` / `--cache` / `--scopes` / `--build-cache` / `--store` / `--keep` / `--invalidate`) — DERIVED from the declared category set in `schema/clean.cue` — the category orchestration, and the report output. `charly clean`'s own CLI calls the engine LOCALLY (no wire hop, same package). The other three callers — `charly box build`'s post-build prune, `charly box list tags`, and `charly check run`'s post-run prune (candy/plugin-check) — reach it via a new `verb:retention` capability (a `spec.RetentionRequest` → `spec.RetentionReply` Invoke), the SAME peer/core-adapter pattern verb:credential/verb:gpu/verb:tunnel already use: core's two callers (already running `LoadConfig` in-process) resolve `defaults.keep_images`/`keep_check_runs` themselves and pass the resolved ints in the request; plugin-check (a peer plugin, not core) reaches verb:retention via `InvokeProvider`. The SAME defaults, for its OWN CLI, resolve PLUGIN-SIDE via the shared `sdk/loaderkit.ResolveRetentionDefaultsViaExecutor` (K-wave 2 cone R6 — the former **"retention-defaults" `HostBuild` seam** `charly/host_build_retention_defaults.go` is DELETED: the loader is plugin-reachable over the reverse channel, so every `verb:retention` caller resolves the tunables itself). clean is **compiled-in** (`charly/charly.yml` `compiled_plugins:`) because its `Invoke(OpRun)` needs the in-proc reverse channel — threaded by `dispatchInProcCommand` ("Seam A") — to reach the host loader legs for that resolve; the out-of-process `CliMain` path has no reverse channel, so the categories needing a resolved keep-default (images/check/deep) error there — list/invalidate need no default and run standalone; `--cache`, `--scopes` and `--build-cache` need neither the defaults nor the container engine, so they run there too (and on a host whose podman is broken); `--store` needs the container engine (it is one of its state surfaces) but no loader default, so it runs out-of-process on a host whose engine answers, and REFUSES there when it does not. This is the same "plugin owns the logic + generic seams for the core-coupled bits" doctrine the vm + pod deploy plugins established — no hidden core-command forward, and no plugin-specific command logic left in core.
+`charly clean` is a **compiled-in COMMAND-class plugin** (`candy/plugin-clean`, `command:clean`) that OWNS the command AND (K1-alpha core-minimization) the **shared retention ENGINE** itself — `pruneImagesByRetention`, `pruneCheckRuns`, `pruneBuildCandyDirs`, `invalidateImageTags`, `pruneDeepDanglingImages`, and the charly-labeled image-tag CalVer/label inventory (`candy/plugin-clean/retention.go`), relocated from the former `charly/retention.go` since it has zero core-only dependencies (`kit.CalVer`/`kit.ListLocalImages`/`kit.BuildActivityDir` are all sdk-portable). The plugin owns the flag grammar (`--dry-run` / `--images` / `--check` / `--deep` / `--cache` / `--scopes` / `--build-cache` / `--store` / `--keep` / `--invalidate`) — DERIVED from the declared category set in `schema/clean.cue` — the category orchestration, and the report output. `charly clean`'s own CLI calls the engine LOCALLY (no wire hop, same package). The other three callers — `charly box build`'s post-build prune, `charly box list tags`, and `charly check run`'s post-run prune (candy/plugin-check) — reach it via a new `verb:retention` capability (a `spec.RetentionRequest` → `spec.RetentionReply` Invoke), the SAME peer/core-adapter pattern verb:credential/verb:gpu/verb:tunnel already use: core's two callers (already running `LoadConfig` in-process) resolve `defaults.keep_images`/`keep_check_runs` themselves and pass the resolved ints in the request; plugin-check (a peer plugin, not core) reaches verb:retention via `InvokeProvider`. The SAME defaults, for its OWN CLI, resolve PLUGIN-SIDE via the shared `sdk/loaderkit.ResolveRetentionDefaultsViaExecutor` (K-wave 2 cone R6 — the former **"retention-defaults" `HostBuild` seam** `charly/host_build_retention_defaults.go` is DELETED: the loader is plugin-reachable over the reverse channel, so every `verb:retention` caller resolves the tunables itself). clean is **compiled-in** (`charly/charly.yml` `compiled_plugins:`) because its `Invoke(OpRun)` needs the in-proc reverse channel — threaded by `dispatchInProcCommand` ("Seam A") — to reach the host loader legs for that resolve; the out-of-process `CliMain` path has no reverse channel, so the categories needing a resolved keep-default (images/check/deep) error there — list/invalidate need no default and run standalone; `--cache`, `--scopes` and `--build-cache` need neither the defaults nor the container engine, so they run there too (and on a host whose podman is broken); `--store` needs BOTH the container engine (one of its state surfaces) and the user configuration, which it reads over the reverse channel — so it requires compiled-in placement too, and the out-of-process CLI REFUSES rather than assume the plugin's 32 GiB fallback. This is the same "plugin owns the logic + generic seams for the core-coupled bits" doctrine the vm + pod deploy plugins established — no hidden core-command forward, and no plugin-specific command logic left in core.
 
 Two artifact classes, two policies (operator principle):
 
@@ -189,11 +189,26 @@ an error naming the surface and the path, and evicts nothing. `--dry-run` refuse
 same inputs — a dry run that predicted an eviction the real run then refused would be a lie about
 the plan.
 
-**The budget is AUTHORED, and it never authorises evicting live state.** `schema/clean.cue`
-`#CleanPlugin.store_budget.bytes` (SDD: CUE first, Go derived — a hard-coded constant is a defect).
-The sweep reports the store's RETAINED bytes against it and says `within budget` or `OVER budget by
-<bytes>`; being over budget is REPORTED, never "fixed", because the entries left are the ones state
-references. The budget is not project-tunable yet — opencharly/plugin-clean#28 carries that half.
+**The ceiling is the MACHINE's, and it never authorises evicting live state.** A machine authors it in
+its USER CONFIGURATION — `~/.config/charly/charly.yml`, the per-host file `D-STORE-2` makes the home for
+what the user sets — as a declared section beside `cache:`/`ledger:`/`deploy:`/`system:`:
+
+```yaml
+clean:
+  store_budget:
+    bytes: 274877906944      # 256 GiB
+```
+
+`bytes` is `int & >0`, projected as `int64` (256 GiB does not fit a 32-bit `int`; the wrap on 386/arm
+would be silent). The plugin's own `schema/clean.cue` `#CleanPlugin.store_budget.bytes` (32 GiB) is the
+FALLBACK for a machine that authors nothing, and the report names which applied: `ceiling: user config`
+vs `ceiling: plugin default`. Three states, never a sentinel: absent (nil at every level) → the
+fallback; authored positive → that number; unreadable or authored non-positive → REFUSE, naming the
+file, because a parse failure must never evict a machine's builds under a ceiling it never wrote.
+
+The sweep reports the store's RETAINED bytes against the ceiling and says `within budget` or `OVER
+budget by <bytes>`; being over budget is REPORTED, never "fixed", because the entries left are the ones
+state references.
 
 **What a dry run can and cannot say.** The DECISION is identical in both modes (same entries, same
 reasons, tested by mutation). The BYTE figure is not: a dry run measures the store as it is (`N

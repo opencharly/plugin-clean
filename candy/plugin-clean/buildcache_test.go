@@ -360,7 +360,7 @@ func TestBuildCache_UnreachableFromTheWireRequest(t *testing.T) {
 	resolveEngine = func() (string, error) { return "", errTestNoEngine }
 	out := runRetentionOutcome(spec.RetentionRequest{
 		Dir: t.TempDir(), DryRun: true, Images: true, Check: true, Deep: true, Cache: true,
-	}, cleanPlan{})
+	}, cleanPlan{}, storeBudget{})
 	if len(out.BuildCache) != 0 {
 		t.Fatalf("the wire-addressable form swept the build cache: %+v", out.BuildCache)
 	}
@@ -386,7 +386,7 @@ func TestBuildCache_NeedsNoContainerEngine(t *testing.T) {
 	l := withBuildCacheRoot(t)
 	writeFile(t, filepath.Join(l.Root, "cache.db"), "db", 32)
 
-	out := runRetentionOutcome(spec.RetentionRequest{DryRun: true}, cleanPlan{buildCache: true})
+	out := runRetentionOutcome(spec.RetentionRequest{DryRun: true}, cleanPlan{buildCache: true}, storeBudget{})
 	if out.Reply.Error != "" {
 		t.Fatalf("a build-cache-only run failed on engine resolution: %s", out.Reply.Error)
 	}
@@ -397,7 +397,7 @@ func TestBuildCache_NeedsNoContainerEngine(t *testing.T) {
 		t.Fatal("the build-cache-only run reported no root")
 	}
 
-	img := runRetentionOutcome(spec.RetentionRequest{Images: true, DryRun: true}, cleanPlan{})
+	img := runRetentionOutcome(spec.RetentionRequest{Images: true, DryRun: true}, cleanPlan{}, storeBudget{})
 	if img.Reply.Error == "" || resolved != 1 {
 		t.Fatalf("an images-only run must resolve the engine and fail on its absence: err=%q resolved=%d",
 			img.Reply.Error, resolved)

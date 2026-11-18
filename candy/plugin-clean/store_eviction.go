@@ -316,9 +316,12 @@ type storeEntryDecision struct {
 
 // storeSweepOutcome is one `--store` run's decision and its measured result.
 type storeSweepOutcome struct {
-	Dir      string
-	Budget   int64
-	Surfaces []storeStateSurface
+	Dir    string
+	Budget int64
+	// BudgetSource is the surface that authored the ceiling the sweep measured against —
+	// `user config` or `plugin default` — so the report can never present one as the other.
+	BudgetSource string
+	Surfaces     []storeStateSurface
 	// Decisions is every enumerated entry, kept and evicted, in key order.
 	Decisions []storeEntryDecision
 	// Evicted is how many entries the sweep removed (or would remove).
@@ -523,8 +526,8 @@ func sortedKeys(m map[string]bool) []string {
 // in-flight entry had not indexed yet). The state inventory is read SECOND and refuses the whole
 // sweep on any doubt. Only then is anything deleted — entries first, then the blobs no surviving
 // entry reaches, through the SAME reclaim the `cache` category uses.
-func runStoreSweep(engineBin string, dryRun bool, budget int64) (*storeSweepOutcome, error) {
-	out := &storeSweepOutcome{Budget: budget, DryRun: dryRun}
+func runStoreSweep(engineBin string, dryRun bool, budget storeBudget) (*storeSweepOutcome, error) {
+	out := &storeSweepOutcome{Budget: budget.Bytes, BudgetSource: budget.Source, DryRun: dryRun}
 
 	if _, _, live := liveBuildFloor(); live > 0 {
 		out.Skip = &retentionSkip{

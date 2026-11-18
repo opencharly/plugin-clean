@@ -144,10 +144,17 @@ plugin-clean:
             address reaches, and evicts the rest before reclaiming the blobs no surviving entry
             reaches. It REFUSES — and evicts nothing — when a state surface cannot be read: an
             unreadable surface is not an empty one, and assuming nothing is referenced would delete
-            the image a running deployment was built from. The size budget is AUTHORED in
-            schema/clean.cue (`#CleanPlugin.store_budget`, SDD) and never a Go constant; an
-            over-budget store is REPORTED, because the only entries left are the ones state
-            references. It never fires on a bare `charly clean`, and a live build makes it DECLINE.
+            the image a running deployment was built from. The CEILING is the MACHINE's: the user
+            configuration (~/.config/charly/charly.yml, D-STORE-2) authors
+            `clean: {store_budget: {bytes: ...}}` (int & >0, int64-projected), and
+            schema/clean.cue's `#CleanPlugin.store_budget` (32 GiB, SDD) is the FALLBACK for a machine
+            that authors nothing — the report names which applied (`ceiling: user config` /
+            `ceiling: plugin default`). An UNREADABLE configuration, or an authored non-positive
+            value, REFUSES rather than falling back: a parse failure must never evict a machine's
+            builds under a ceiling it never wrote. Because the configuration is read over the reverse
+            channel, the store category requires compiled-in placement. An over-budget store is
+            REPORTED, because the only entries left are the ones state references. It never fires on a
+            bare `charly clean`, and a live build makes it DECLINE.
 
             The `--cache` category also disposes of the store roots the migration record retires, and one
             of them is an INGEST rather than a removal (opencharly/plugin-clean#30): when sdk#556 moved
@@ -236,7 +243,7 @@ plugin-clean:
               id: clean-store-category-present
               context:
                 - build
-              command: "grep -q 'runStoreSweep' store_eviction.go && grep -q 'planStoreEviction' store_eviction.go && grep -q 'refusing to evict' store_eviction.go && grep -q 'classifyStore' store_identity.go && grep -q 'declaredStoreBudget' categories.go && grep -q 'store_budget' schema/clean.cue"
+              command: "grep -q 'runStoreSweep' store_eviction.go && grep -q 'planStoreEviction' store_eviction.go && grep -q 'refusing to evict' store_eviction.go && grep -q 'classifyStore' store_identity.go && grep -q 'declaredStoreBudget' categories.go && grep -q 'store_budget' schema/clean.cue && grep -q 'effectiveStoreBudget' store_budget.go && grep -q 'budgetFromCleanSection' store_budget.go && grep -q 'ceiling: %s' command.go && grep -q 'LoadHostCleanSectionViaExecutor' store_budget.go"
             - check: the build-cache category ships its guard, its quarantine discovery and its per-root report
               id: clean-build-cache-category-present
               context:

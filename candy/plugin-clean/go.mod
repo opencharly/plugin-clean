@@ -2,7 +2,7 @@ module github.com/opencharly/plugin-clean/candy/plugin-clean
 
 go 1.26.8
 
-require github.com/opencharly/sdk v0.2026322.1227
+require github.com/opencharly/sdk v0.2026322.1913
 
 require (
 	cuelabs.dev/go/oci/ociregistry v0.0.0-20251212221603-3adeb8663819 // indirect
@@ -33,7 +33,7 @@ require (
 	github.com/mattn/go-isatty v0.0.17 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/oklog/run v1.1.0 // indirect
-	github.com/opencharly/spec v0.2026322.1111
+	github.com/opencharly/spec v0.2026322.1814
 	github.com/pelletier/go-toml/v2 v2.4.3 // indirect
 	github.com/protocolbuffers/txtpbfmt v0.0.0-20260217160748-a481f6a22f94 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
