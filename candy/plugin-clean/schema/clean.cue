@@ -11,8 +11,12 @@
 // command:clean's authored input is its pass-through CLI grammar (the OpRun `{args:
 // [...]}` envelope) and verb:retention is invoked by peer plugins via InvokeProvider, so
 // this schema DOCUMENTS both capability contracts rather than a structured
-// plugin_input. SELF-CONTAINED: it references no base def, so it compiles STANDALONE
-// (the property that lets the SDK compile it serve-side).
+// plugin_input. SELF-CONTAINED: it imports nothing and references no base def, so it compiles
+// STANDALONE — which is not a preference but a MEASURED constraint: the in-process compile this
+// plugin runs over its own schema (the `cleanCategories` path) has no CUE module for `spec`, so an
+// `import "github.com/opencharly/spec/schema"` fails there with "package ... imported but not
+// defined", while charly's own tooling resolves it. The consequence is recorded where it belongs:
+// `#CleanStoreBudget` deliberately does not answer to the contract's name (opencharly/plugin-clean#35).
 #CleanPlugin: {
 	// The declared capability words (the plugin.providers surface) — the command:clean
 	// CLI plus the verb:retention engine peers invoke — recorded here as part of the
@@ -32,19 +36,29 @@
 	// of the plugin's published declaration surface.
 	config?: [string]: string
 
-	// store_budget — D-STORE-7's SIZE BUDGET for the charly image store, authored here
-	// because it is a VALUE the sweep decides against and no hard-coded constant may stand
-	// in for it (SDD: authored configuration is CUE before it is code). The `store`
-	// category reports the bytes the store RETAINS against this ceiling; it never evicts a
-	// state-referenced entry to meet it, and a store its own referenced entries keep above
-	// the budget is reported as OVER budget, naming the referenced bytes as the reason.
+	// store_budget — D-STORE-7's SIZE BUDGET for the charly image store. The CEILING is the
+	// machine's: a host authors it in its USER CONFIGURATION (`~/.config/charly/charly.yml`,
+	// D-STORE-2) as `clean: {store_budget: {bytes: ...}}`, declared by opencharly/spec
+	// (`#CleanSection` / `#StoreBudget`, spec#384) and read by this plugin through
+	// `loaderkit.LoadHostCleanSectionViaExecutor` (sdk#566). What is declared HERE is the
+	// FALLBACK a machine that authors nothing gets, and the report names which applied —
+	// `ceiling: user config` or `ceiling: plugin default`.
 	//
-	// The budget is the plugin's own declaration surface rather than a project `defaults:`
-	// key because that key would have to be a field of the shared `#Defaults` in
-	// opencharly/spec — a cross-repo schema change, deliberately not guessed at here
-	// (opencharly/plugin-clean#28 carries that half). Until it lands, this value is the ONE
-	// place the ceiling is written down, and the Go that reads it derives it here.
-	store_budget: #StoreBudget
+	// The SHAPE below is deliberately local and deliberately NAMED DIFFERENTLY from the
+	// contract's `#StoreBudget`: one name is one S1 definition (opencharly/plugin-clean#35), so
+	// this definition must not answer to the contract's name. It cannot simply import
+	// `schema.#StoreBudget` either, and that was MEASURED rather than assumed: charly's own
+	// tooling resolves the import (`charly candy params plugin-clean` succeeds), but this
+	// plugin's in-process compile of its own schema — the path `cleanCategories` uses — has no
+	// CUE module for `spec` and fails with "package
+	// github.com/opencharly/spec/schema imported but not defined". Two homes for one SHAPE
+	// remain, which R2 accepts here only because one of them cannot see the other; the VALUE
+	// still lives only in this file, since `spec` declares no default.
+	//
+	// The `store` category reports the bytes the store RETAINS against the ceiling; it never
+	// evicts a state-referenced entry to meet it, and a store whose own referenced entries
+	// keep it above the ceiling is reported as OVER it, naming the referenced bytes.
+	store_budget: #CleanStoreBudget
 	store_budget: {
 		// 32 GiB: a full multi-stage stack for one box family is a few GiB, so this holds
 		// several live families beside the referenced set while still bounding a host whose
@@ -134,16 +148,15 @@
 	implies?: [...string]
 }
 
-// #StoreBudget is D-STORE-7's size budget for the charly image store (see
-// #CleanPlugin.store_budget). It is a DEF because the ceiling will grow clauses — what a
-// sweep does when the store is over it is a policy question this row has to be able to
-// answer later without re-shaping every reader.
-#StoreBudget: {
-	// bytes — the ceiling, in bytes, of what the store may RETAIN after a sweep: the bytes
-	// the entries that survive still reach. A budget is a ceiling on the RETAINED set, never
-	// a licence to evict a referenced entry, so a store whose own referenced entries exceed
-	// it is reported (never "fixed" by deleting live state). Zero is rejected rather than
-	// read as "unlimited": a disabled budget and an unset one would be the same value, and
-	// the sweep could not tell "the operator set no ceiling" from "the ceiling is zero".
+// #CleanStoreBudget is THIS PLUGIN'S fallback ceiling for the charly image store (see
+// #CleanPlugin.store_budget) — not the contract's `#StoreBudget`, which is `spec`'s and answers
+// to that name alone (opencharly/plugin-clean#35). Same shape, different name, for the measured
+// reason given at the field: the in-process schema compile cannot resolve a `spec` import.
+#CleanStoreBudget: {
+	// bytes — the fallback ceiling, in bytes, of what the store may RETAIN after a sweep: the
+	// bytes the entries that survive still reach. It is a ceiling on the RETAINED set, never a
+	// licence to evict a referenced entry. Zero is rejected rather than read as "unlimited":
+	// a disabled budget and an unset one would otherwise be the same value.
 	bytes: int & >0
 }
+
