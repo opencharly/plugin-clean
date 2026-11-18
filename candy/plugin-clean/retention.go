@@ -97,6 +97,24 @@ type retentionOutcome struct {
 	// session), never when it merely found nothing.
 	ScopeSkip *retentionSkip
 
+	// Store is the `store` category (D-STORE-7): the image store's entry decision and its measured
+	// result. It rides HERE, not on spec.RetentionReply, for the same reason the skip signals and
+	// the scopes do: only `charly clean`'s own CLI reaches it — a peer's post-build or post-run
+	// prune must NEVER evict a store entry — and the shared wire type would need a field every
+	// peer decodes for a reply no peer reads.
+	Store *storeSweepOutcome
+
+	// CacheSweep is the `cache` category's per-store outcome: the wire row (which rides on
+	// spec.RetentionReply.CacheStores, unchanged) PLUS the reader that swept it, which the report
+	// names — "swept by storekit" and "swept by spec/cache" are the two answers that made
+	// opencharly/plugin-clean#27 invisible.
+	CacheSweep []cacheStoreOutcome
+
+	// RefusedStores is the `cache` category's refusal list: named stores whose reader could not
+	// be decided from the store's own index. They are reported and left untouched, because a
+	// store swept by the wrong reader is how opencharly/plugin-clean#27 destroyed an image.
+	RefusedStores []refusedStore
+
 	// BuildCache is the unit list of the `build-cache` category: one entry PER ROOT (the live
 	// state root, then each quarantined sibling), each carrying its own bytes and its own status.
 	// It rides HERE, not on spec.RetentionReply, for the same reason the skip signals and the
@@ -125,7 +143,10 @@ func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan) retentionOut
 	// residue of a build that already failed. Both this file's and the candy description's "needs
 	// neither the engine binary nor the resolved keep-defaults" are therefore true by construction,
 	// not by assertion, and TestScopesOnlyRunNeedsNoEngine pins it.
-	needsEngine := req.Invalidate != "" || req.List || req.BuildPrune || req.Images || req.Deep
+	// The `store` category needs the engine too: the container list IS one of its two state
+	// surfaces (D-STORE-7's keep set), so a host whose engine cannot be listed must refuse rather
+	// than sweep against a partial inventory.
+	needsEngine := req.Invalidate != "" || req.List || req.BuildPrune || req.Images || req.Deep || plan.store
 	var engineBin string
 	if needsEngine {
 		var err error
@@ -207,12 +228,31 @@ func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan) retentionOut
 		reply.DeepBytes = bytes
 		out.DeepSkip = skip
 	}
+	if plan.store {
+		budget, berr := declaredStoreBudget()
+		if berr != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("the image store's size budget: %v", berr)}}
+		}
+		// BEFORE the cache sweep, deliberately: the entry eviction reclaims its own store's blobs
+		// through the shared reclaim, and a `--store --cache` run must not report the registry
+		// twice for one sweep.
+		store, serr := runStoreSweep(engineBin, req.DryRun, budget)
+		if serr != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: serr.Error()}}
+		}
+		out.Store = store
+	}
 	if req.Cache {
-		stores, cerr := gcCacheStores(req.DryRun)
+		sweep, refused, cerr := gcCacheStores(req.DryRun)
 		if cerr != nil {
 			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("GCing the cache stores: %v", cerr)}}
 		}
-		reply.CacheStores = stores
+		reply.CacheStores = make([]spec.CacheStoreInfo, 0, len(sweep))
+		for _, s := range sweep {
+			reply.CacheStores = append(reply.CacheStores, s.Info)
+		}
+		out.CacheSweep = sweep
+		out.RefusedStores = refused
 		// The SAME category, the OTHER instrument: GC reclaims unreferenced blobs inside live
 		// stores; this retires whole roots the migration record has retired (opencharly/
 		// charly-registry#11). One category, because an operator asking what the cache holds is
@@ -340,154 +380,80 @@ func treeBytes(dir string) int64 {
 	return total
 }
 
-// gcCacheStores reclaims unreferenced blobs from EVERY named ArtifactStore this
-// host has, under BOTH cache roots — the `cache` category, `charly clean
-// --cache`.
+// gcCacheStores reclaims unreferenced blobs from EVERY named ArtifactStore this host has — the
+// `cache` category, `charly clean --cache`.
 //
-// # TWO ROOTS, TWO STORES, and why one loop was not enough
+// # ONE inventory, ONE reader per store, chosen by the store's IDENTITY
 //
-// There are two independent content-addressed stores on a host, and they are
-// rooted in different places:
+// This used to sweep in two halves — `spec/cache` layouts under the CONFIG root, `storekit`
+// stores under the CACHE root — and SKIPPED the second whenever the two roots resolved to the
+// same directory. `CHARLY_CACHE_DIR` makes them coincide (it is the ONE override `D-STORE-1`
+// blesses and the way a bed isolates itself), so on exactly those hosts the storekit-written
+// `registry` store was handed to `spec/cache`'s image-blind `GCStats`, which deleted the image's
+// manifest, config and layers and left the entry answering `Lookup(ref)` for content that no
+// longer existed (opencharly/plugin-clean#27). The mirror-image mistake was available too: with
+// the roots coincident, `storekit.NamedStores()` lists the `spec/cache` layouts, and storekit's
+// reader would have decoded their manifests as empty entries and freed their payloads.
 //
-//	spec/cache  -> the CONFIG root (`$CHARLY_CONFIG_DIR`-adjacent), reached by
-//	                cache.NamedStores() and swept by each layout's own GCStats.
-//	storekit    -> the CACHE root (`$CHARLY_CACHE_DIR` else ~/.cache/charly),
-//	                reached by storekit.NamedStores() and swept by the reclaim
-//	                surface added in opencharly/sdk#416.
+// So the routing is neither "which root" nor "which enumerator": `discoverStores` builds ONE
+// deduped inventory and `classifyStore` decides each store's reader from its OWN index
+// (`application/vnd.opencharly.store.entry.v1+json` descriptors → storekit; OCI image manifest
+// descriptors → spec/cache). A store whose identity cannot be decided is REFUSED and reported,
+// never guessed: an unreadable store is not an empty one.
 //
-// This function used to reach only the first, so a store the one-store migration
-// writes was invisible to the sweep: measured on this host, `charly clean --cache`
-// reclaimed 5 664 blobs (~106 MiB) from the config root and NOTHING from the cache
-// root, while `storekit.NamedStores()` over that same cache root listed stores that
-// `cache.NamedStores()` could not see. That is opencharly/plugin-clean#14.
-//
-// # Why this is two loops rather than one
-//
-// The two halves cannot share a loop, and the reason is not stylistic: they sweep
-// through DIFFERENT primitives. `spec/cache` owns a `GCStats` that computes and
-// removes in one call; `storekit` deliberately splits discovery from removal
-// (`UnreferencedBlobs` names candidates, `RemoveBlob` takes one) so a caller's
-// destructive half stays with the surface that also reports it. Forcing one loop
-// over both would mean a branch on the store's type inside it — a shared shape that
-// hides the difference instead of expressing it. They share the RESULT type
-// (`spec.CacheStoreInfo`) and the report, which is the contract that matters.
-//
-// No live-build guard is needed here — both halves touch only a CAS blob store,
-// never the podman image store the guard protects. An empty or absent root is an
-// empty list, never an error. Read-only under dryRun: the config half computes the
-// same set without removing, and the cache half lists without calling RemoveBlob.
-func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, error) {
-	var out []spec.CacheStoreInfo
-
-	// HALF ONE — the CONFIG-rooted `spec/cache` stores.
-	names, err := cache.NamedStores()
+// No live-build guard is needed here: both readers touch only a CAS blob store, and storekit's
+// index lock lives in the runtime root (`<runtime>/store-index/<store>.lock`), never inside the
+// store tree — which is also why nothing here writes a `spec/cache` `.lock` into an image store
+// any more (D-STORE-3). An empty or absent root is an empty list, never an error. Read-only under
+// dryRun: both readers compute the same set without removing.
+func gcCacheStores(dryRun bool) ([]cacheStoreOutcome, []refusedStore, error) {
+	stores, err := discoverStores()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	for _, name := range names {
-		l := cache.OpenNamedLayout(name)
-		reclaim, gerr := l.GCStats(dryRun)
-		if gerr != nil {
-			return nil, fmt.Errorf("store %q: %w", name, gerr)
-		}
-		out = append(out, spec.CacheStoreInfo{
-			Name:         name,
-			Entries:      int64(l.Len()),
-			RemovedBlobs: int64(reclaim.RemovedBlobs),
-			RemovedBytes: reclaim.RemovedBytes,
-		})
-	}
-
-	// HALF TWO — the CACHE-rooted `storekit` stores, the ones the one-store
-	// migration writes and the first loop could not see.
-	//
-	// # The roots can COINCIDE, and when they do this half must not run
-	//
-	// The two resolvers do NOT disagree about the override, which makes them
-	// coincide whenever it is set:
-	//
-	//	spec/cache  StoreRoot():  $CHARLY_CACHE_DIR  else  ~/.config/charly/cache/
-	//	storekit    CacheDir():   $CHARLY_CACHE_DIR  else  ~/.cache/charly
-	//
-	// With CHARLY_CACHE_DIR set, BOTH roots are that one directory — so a second
-	// loop would enumerate the same layouts the first already swept, count them
-	// twice, and, on a real run, hand storekit a `spec/cache` layout to delete from.
-	// Measured: the first draft of this change did exactly that, and the existing
-	// test failed naming stores it had never created.
-	//
-	// With the override UNSET the roots genuinely differ — ~/.config/charly/cache
-	// against ~/.cache/charly — and that is the live-host case this change exists
-	// for: `charly clean --cache` reached the config root while `storekit
-	// .NamedStores()` over the cache root reported stores `spec/cache` could not
-	// see (opencharly/plugin-clean#14).
-	//
-	// So the skip is not a special case for tests; it is the rule that the two
-	// halves must partition the stores rather than overlap. Comparing the RESOLVED
-	// roots, not the environment variable, keeps it true if either resolver changes.
-	if sameStoreRoot() {
-		return out, nil
-	}
-	skNames, err := storekit.NamedStores()
-	if err != nil {
-		return nil, fmt.Errorf("storekit stores: %w", err)
-	}
-	for _, name := range skNames {
-		s, oerr := storekit.OpenStore(name)
-		if oerr != nil {
-			return nil, fmt.Errorf("store %q: %w", name, oerr)
-		}
-		entries, eerr := s.Entries()
-		if eerr != nil {
-			return nil, fmt.Errorf("store %q: %w", name, eerr)
-		}
-		cands, cerr := s.UnreferencedBlobs()
-		if cerr != nil {
-			return nil, fmt.Errorf("store %q: %w", name, cerr)
-		}
-		info := spec.CacheStoreInfo{
-			Name:         name,
-			Entries:      int64(len(entries)),
-			RemovedBytes: storekit.BlobBytes(cands),
-		}
-		for _, c := range cands {
-			// The report counts what the sweep RECLAIMED on a real run and what it
-			// WOULD reclaim on a dry one, exactly as the config half's GCStats does
-			// — so `--dry-run` and the real run agree on the number, which is the
-			// property that makes the dry run worth trusting.
-			if !dryRun {
-				if rerr := s.RemoveBlob(c.Digest); rerr != nil {
-					return nil, fmt.Errorf("store %q: remove %s: %w", name, c.Digest, rerr)
-				}
+	var out []cacheStoreOutcome
+	var refused []refusedStore
+	for _, st := range stores {
+		switch st.Reader {
+		case storeReaderStorekit:
+			s := storekit.OpenStoreDir(st.Dir)
+			entries, eerr := s.Entries()
+			if eerr != nil {
+				return nil, refused, fmt.Errorf("store %q: %w", st.Name, eerr)
 			}
-			info.RemovedBlobs++
+			blobs, bytes, serr := sweepStoreBlobs(s, dryRun)
+			if serr != nil {
+				return nil, refused, fmt.Errorf("store %q: %w", st.Name, serr)
+			}
+			out = append(out, cacheStoreOutcome{
+				Info: spec.CacheStoreInfo{
+					Name:         st.Name,
+					Entries:      int64(len(entries)),
+					RemovedBlobs: blobs,
+					RemovedBytes: bytes,
+				},
+				Reader: st.Reader,
+			})
+		case storeReaderSpecCache:
+			l := cache.OpenLayout(st.Dir)
+			reclaim, gerr := l.GCStats(dryRun)
+			if gerr != nil {
+				return nil, refused, fmt.Errorf("store %q: %w", st.Name, gerr)
+			}
+			out = append(out, cacheStoreOutcome{
+				Info: spec.CacheStoreInfo{
+					Name:         st.Name,
+					Entries:      int64(l.Len()),
+					RemovedBlobs: int64(reclaim.RemovedBlobs),
+					RemovedBytes: reclaim.RemovedBytes,
+				},
+				Reader: st.Reader,
+			})
+		default:
+			refused = append(refused, refusedStore{Name: st.Name, Dir: st.Dir, Reason: st.Reason})
 		}
-		out = append(out, info)
 	}
-
-	return out, nil
-}
-
-// sameStoreRoot reports whether `spec/cache` and `storekit` resolve to the SAME
-// directory, in which case the two halves of gcCacheStores would sweep one set of
-// stores twice.
-//
-// It compares the RESOLVED paths rather than reading CHARLY_CACHE_DIR, because the
-// thing that matters is where the two resolvers actually point, not which
-// environment variable happens to be set: a future resolver change that aligned the
-// two defaults would make the overlap real without any env var involved. A resolver
-// error is reported as NOT the same root — the caller's first half has already
-// failed loudly on the same resolver by then, so returning false here cannot hide a
-// broken root behind a skip.
-func sameStoreRoot() bool {
-	a, err := cache.StoreRoot()
-	if err != nil {
-		return false
-	}
-	b, err := storekit.CacheDir()
-	if err != nil {
-		return false
-	}
-	return filepath.Clean(a) == filepath.Clean(b)
+	return out, refused, nil
 }
 
 // resolveEngineName names the CONTAINER ENGINE this plugin shells for its image-tag inventory,

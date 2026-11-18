@@ -32,6 +32,27 @@
 	// of the plugin's published declaration surface.
 	config?: [string]: string
 
+	// store_budget — D-STORE-7's SIZE BUDGET for the charly image store, authored here
+	// because it is a VALUE the sweep decides against and no hard-coded constant may stand
+	// in for it (SDD: authored configuration is CUE before it is code). The `store`
+	// category reports the bytes the store RETAINS against this ceiling; it never evicts a
+	// state-referenced entry to meet it, and a store its own referenced entries keep above
+	// the budget is reported as OVER budget, naming the referenced bytes as the reason.
+	//
+	// The budget is the plugin's own declaration surface rather than a project `defaults:`
+	// key because that key would have to be a field of the shared `#Defaults` in
+	// opencharly/spec — a cross-repo schema change, deliberately not guessed at here
+	// (opencharly/plugin-clean#28 carries that half). Until it lands, this value is the ONE
+	// place the ceiling is written down, and the Go that reads it derives it here.
+	store_budget: #StoreBudget
+	store_budget: {
+		// 32 GiB: a full multi-stage stack for one box family is a few GiB, so this holds
+		// several live families beside the referenced set while still bounding a host whose
+		// store grows by one artifact per rebuild (the 283 GiB / 172-entry store measured
+		// when D-STORE-7 was implemented had no ceiling at all).
+		bytes: 32 * 1024 * 1024 * 1024
+	}
+
 	// categories — the AUTHORED category set of `charly clean`. This list is the ONE
 	// declaration of what a category IS: its flag word, the one line a reader is told
 	// about it, whether a BARE invocation runs it, and what naming it also runs. The Go
@@ -78,6 +99,11 @@
 			bare: true
 		},
 		{
+			flag: "store"
+			contract: "Only the charly image store's ENTRY retention (D-STORE-7): keep the entries the host's charly state still references — the container engine's containers and the quadlet units — evict the rest, free the blobs no surviving entry reaches, and report the retained size against the store budget; it REFUSES to evict when a state surface cannot be read, because an unreadable surface is not an empty one. Never fires on a bare run"
+			bare: false
+		},
+		{
 			flag: "build-cache"
 			// ⚑ No BACKTICKS in a contract string: Go's flag package reads a backtick-quoted name
 			// as the flag's VALUE NAME, so a contract carrying one is printed as
@@ -106,4 +132,18 @@
 	// implies — the categories that ALSO run when this one is named. Every entry names a
 	// declared row (checked when the set is decoded, so a typo fails loudly).
 	implies?: [...string]
+}
+
+// #StoreBudget is D-STORE-7's size budget for the charly image store (see
+// #CleanPlugin.store_budget). It is a DEF because the ceiling will grow clauses — what a
+// sweep does when the store is over it is a policy question this row has to be able to
+// answer later without re-shaping every reader.
+#StoreBudget: {
+	// bytes — the ceiling, in bytes, of what the store may RETAIN after a sweep: the bytes
+	// the entries that survive still reach. A budget is a ceiling on the RETAINED set, never
+	// a licence to evict a referenced entry, so a store whose own referenced entries exceed
+	// it is reported (never "fixed" by deleting live state). Zero is rejected rather than
+	// read as "unlimited": a disabled budget and an unset one would be the same value, and
+	// the sweep could not tell "the operator set no ceiling" from "the ceiling is zero".
+	bytes: int & >0
 }

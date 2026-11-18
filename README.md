@@ -13,7 +13,7 @@ post-run prune) reach the engine over `verb:retention`.
 
 | Capability | Surface |
 |---|---|
-| `command:clean` | the `charly clean` CLI — `--dry-run`, `--images`, `--check`, `--deep`, `--cache`, `--scopes`, `--build-cache`, `--keep`, `--invalidate` |
+| `command:clean` | the `charly clean` CLI — `--dry-run`, `--images`, `--check`, `--deep`, `--cache`, `--scopes`, `--build-cache`, `--store`, `--keep`, `--invalidate` |
 | `verb:retention` | the shared retention engine, invoked by peer plugins |
 
 ## The command
@@ -21,7 +21,15 @@ post-run prune) reach the engine over `verb:retention`.
 - **default** — the charly-labeled dangling-image sweep.
 - **`--images`** — prune images by the retention policy (`keep_images`).
 - **`--check`** — prune `.check` runs (`keep_check_runs`).
-- **`--cache`** — the CAS `ArtifactStore` GC.
+- **`--cache`** — the CAS `ArtifactStore` GC. The reader for each store is chosen from the
+  store's OWN index (storekit entry manifests → storekit, OCI image manifests → `spec/cache`), never
+  from the root it sits under: the image store must never be swept by the image-blind reader
+  (opencharly/plugin-clean#27), and a store that cannot be classified is refused and reported.
+- **`--store`** — `D-STORE-7`: keep the charly image store's entries that the host's charly state
+  still references (the container engine's containers and the quadlet units), evict the rest, free
+  the blobs no surviving entry reaches, and report the retained size against the AUTHORED budget
+  (`schema/clean.cue` `store_budget`). It REFUSES — evicting nothing — when a state surface cannot
+  be read, because an unreadable surface is not an empty one. Strictly opt-in.
 - **`--scopes`** — reap HUNG transient build scopes: the systemd user scopes
   buildah/podman put a build container into (`runc-buildah-*.scope`). A scope is
   stopped only when it has been active for at least an hour AND no

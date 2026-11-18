@@ -9,9 +9,9 @@ import (
 	"github.com/opencharly/spec/spec"
 )
 
-// namedSet builds the map cleanCategories resolves from the six category flags, so a case reads
-// as the flags an operator typed rather than as a positional tuple.
-func namedSet(images, check, deep, cacheGC, scopes, buildCache bool) map[string]bool {
+// namedSet builds the map cleanCategories resolves from the category flags, so a case reads as the
+// flags an operator typed rather than as a positional tuple.
+func namedSet(images, check, deep, cacheGC, scopes, buildCache, store bool) map[string]bool {
 	out := map[string]bool{}
 	for word, on := range map[string]bool{
 		"images":      images,
@@ -20,6 +20,7 @@ func namedSet(images, check, deep, cacheGC, scopes, buildCache bool) map[string]
 		"cache":       cacheGC,
 		"scopes":      scopes,
 		"build-cache": buildCache,
+		"store":       store,
 	} {
 		if on {
 			out[word] = true
@@ -46,10 +47,10 @@ func TestCleanCategories(t *testing.T) {
 	cases := []struct {
 		name                         string
 		images, check, deep, cacheGC bool
-		scopes, buildCache           bool
+		scopes, buildCache, store    bool
 		want                         cleanPlan
 	}{
-		{name: "no flags: full default sweep, scopes included, deep and build-cache excluded",
+		{name: "no flags: full default sweep, scopes included, deep, store and build-cache excluded",
 			want: cleanPlan{images: true, check: true, scopes: true}},
 		{name: "--images alone: only images, no scopes",
 			images: true,
@@ -93,16 +94,22 @@ func TestCleanCategories(t *testing.T) {
 		{name: "--build-cache + --deep: deep, its scope reap, and the builder's cache",
 			deep: true, buildCache: true,
 			want: cleanPlan{deep: true, scopes: true, buildCache: true}},
+		{name: "--store alone: ONLY the store eviction — it never fires implicitly (D-STORE-7)",
+			store: true,
+			want:  cleanPlan{store: true}},
+		{name: "--store + --images: both, check excluded, and no default leaks in",
+			images: true, store: true,
+			want: cleanPlan{images: true, store: true}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := cleanCategories(namedSet(c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache))
+			got, err := cleanCategories(namedSet(c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, c.store))
 			if err != nil {
 				t.Fatalf("cleanCategories: %v", err)
 			}
 			if got != c.want {
-				t.Errorf("cleanCategories(images=%v,check=%v,deep=%v,cache=%v,scopes=%v,build-cache=%v) = %+v, want %+v",
-					c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, got, c.want)
+				t.Errorf("cleanCategories(images=%v,check=%v,deep=%v,cache=%v,scopes=%v,build-cache=%v,store=%v) = %+v, want %+v",
+					c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, c.store, got, c.want)
 			}
 		})
 	}
@@ -174,6 +181,7 @@ func TestCleanCategoriesParseTheFullGrammar(t *testing.T) {
 		{args: []string{"--build-cache"}, want: cleanPlan{buildCache: true}},
 		{args: []string{"--build-cache", "--dry-run"}, want: cleanPlan{buildCache: true}},
 		{args: []string{"--deep", "--dry-run", "--keep", "1"}, want: cleanPlan{deep: true, scopes: true}},
+		{args: []string{"--store", "--dry-run"}, want: cleanPlan{store: true}},
 	}
 	for _, c := range cases {
 		var f cleanFlags
@@ -297,17 +305,26 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 func TestPrintRetentionResult_CacheCategory(t *testing.T) {
 	t.Run("named stores", func(t *testing.T) {
 		var buf bytes.Buffer
-		out := retentionOutcome{Reply: spec.RetentionReply{CacheStores: []spec.CacheStoreInfo{
-			{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20},
-			{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0},
-		}}}
+		out := retentionOutcome{
+			Reply: spec.RetentionReply{CacheStores: []spec.CacheStoreInfo{
+				{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20},
+				{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0},
+			}},
+			// The READER that swept each store travels beside the wire row: after
+			// opencharly/plugin-clean#27 a store swept by the wrong reader looked exactly like one
+			// swept by the right one, so the report names it.
+			CacheSweep: []cacheStoreOutcome{
+				{Info: spec.CacheStoreInfo{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20}, Reader: storeReaderStorekit},
+				{Info: spec.CacheStoreInfo{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0}, Reader: storeReaderSpecCache},
+			},
+		}
 		if err := printRetentionResult(&buf, "removed", cleanPlan{cache: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := buf.String()
 		for _, want := range []string{
-			"cache project: 7 live entry(ies); removed 3 unreferenced blob(s)",
-			"cache materialized: 2 live entry(ies); removed 0 unreferenced blob(s)",
+			"cache project (storekit): 7 live entry(ies); removed 3 unreferenced blob(s)",
+			"cache materialized (spec/cache): 2 live entry(ies); removed 0 unreferenced blob(s)",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("output missing %q:\n%s", want, got)
