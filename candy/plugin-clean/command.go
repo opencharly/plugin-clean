@@ -30,19 +30,64 @@ import (
 // has NO reverse channel, so --invalidate/images/check/deep (which need the resolved keep-defaults)
 // error there; runCleanCLI's own engine calls otherwise work standalone (list/invalidate need no
 // defaults).
+//
+// THE CATEGORY SET IS DECLARED IN THE SCHEMA, NOT HERE (categories.go + schema/clean.cue): this file
+// registers one flag per declared row and prints what the plan resolved to. There is no
+// `anyCategory := …` chain and no `doScopes = …` rule left in Go — the default set and the
+// `--deep` → `scopes` implication are the declaration's own `bare:`/`implies:` fields.
 
-// runCleanCLI parses the clean flags and drives the categories: --invalidate (targeted image-tag
-// invalidation), images (+ build-candy staging), check runs, and the store-wide --deep purge.
-func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
+// cleanFlags is the parsed `charly clean` grammar: the MODIFIERS — `--dry-run`, `--keep`,
+// `--invalidate` — which tune or target a category rather than naming one, plus one flag per
+// DECLARED category (schema/clean.cue).
+type cleanFlags struct {
+	dryRun     bool
+	keep       int
+	invalidate string
+	// vars holds the pointer each declared category's flag writes to, so the named set can be
+	// read back after Parse without a per-word variable — the declaration decides how many there
+	// are, and a category added to the schema is a flag the moment the row exists.
+	vars map[string]*bool
+}
+
+// named returns the categories this invocation named, in the form cleanCategories resolves.
+func (f *cleanFlags) named() map[string]bool {
+	out := make(map[string]bool, len(f.vars))
+	for word, p := range f.vars {
+		out[word] = *p
+	}
+	return out
+}
+
+// newCleanFlagSet builds the grammar: the modifiers, then ONE flag per category declared in
+// schema/clean.cue — its word as the flag name, its `contract:` line as the help text. It returns
+// an error rather than panicking when the declaration cannot be read or decoded, so a broken
+// embedded schema is a reported defect instead of a crash in a compiled-in command.
+func newCleanFlagSet(f *cleanFlags) (*flag.FlagSet, error) {
+	cats, err := declaredCategories()
+	if err != nil {
+		return nil, err
+	}
 	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
-	dryRun := fs.Bool("dry-run", false, "Print everything that would be removed; touch nothing")
-	images := fs.Bool("images", false, "Only image-tag retention")
-	check := fs.Bool("check", false, "Only check-run retention")
-	deep := fs.Bool("deep", false, "Purge every untagged/dangling image in local storage (not just charly-labeled) plus any layer blobs they alone held — reports UP TO the summed image size, since layers SHARED with kept images reduce actual reclaim; pair with --invalidate for the fullest reclaim. Runs ONLY this category unless combined with --images/--check")
-	cacheGC := fs.Bool("cache", false, "Reclaim unreferenced blobs from every named charly cache (the content-addressed ArtifactStore's own GC); reports each store's live entries + reclaimed blobs/bytes. Runs ONLY this category unless combined with --images/--check/--deep")
-	scopes := fs.Bool("scopes", false, "Reap HUNG transient build scopes — the systemd user scopes buildah/podman put a build container into (e.g. runc-buildah-*.scope). A scope is stopped only when it has been active for at least "+buildScopeMaxAge.String()+" AND no buildah/podman builder process is alive anywhere on the host. Runs by default and with --deep; any other explicit category suppresses it")
-	keep := fs.Int("keep", 0, "Override the retention count for this run (0 = use defaults:)")
-	invalidate := fs.String("invalidate", "", "Remove every charly-labeled image tag matching this glob (full ref or last path segment); runs ONLY the invalidation")
+	fs.BoolVar(&f.dryRun, "dry-run", false, "Print everything that would be removed; touch nothing")
+	fs.IntVar(&f.keep, "keep", 0, "Override the retention count for this run (0 = use defaults:)")
+	fs.StringVar(&f.invalidate, "invalidate", "", "Remove every charly-labeled image tag matching this glob (full ref or last path segment); runs ONLY the invalidation")
+	f.vars = make(map[string]*bool, len(cats))
+	for _, c := range cats {
+		f.vars[c.Flag] = fs.Bool(c.Flag, false, c.Contract)
+	}
+	return fs, nil
+}
+
+// runCleanCLI parses the clean flags and drives the categories the plan resolved to:
+// --invalidate (targeted image-tag invalidation), images (+ build-candy staging), check runs, the
+// store-wide --deep purge, the --cache blob/retired-root sweep, the --scopes reaper, and the
+// --build-cache reclaim of the builder's persistent cache.
+func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
+	var f cleanFlags
+	fs, err := newCleanFlagSet(&f)
+	if err != nil {
+		return err
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -51,53 +96,58 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 		return err
 	}
 	tag := "removed"
-	if *dryRun {
+	if f.dryRun {
 		tag = "would remove"
 	}
 
 	// --invalidate: targeted image-tag invalidation ONLY. Needs no keep-defaults.
-	if *invalidate != "" {
-		reply := runRetention(spec.RetentionRequest{Dir: dir, DryRun: *dryRun, Invalidate: *invalidate})
+	if f.invalidate != "" {
+		reply := runRetention(spec.RetentionRequest{Dir: dir, DryRun: f.dryRun, Invalidate: f.invalidate})
 		if reply.Error != "" {
 			return fmt.Errorf("%s", reply.Error)
 		}
-		fmt.Printf("invalidate: %s %d tag(s) matching %q\n", tag, len(reply.ImageRefs), *invalidate)
+		fmt.Printf("invalidate: %s %d tag(s) matching %q\n", tag, len(reply.ImageRefs), f.invalidate)
 		for _, r := range reply.ImageRefs {
 			fmt.Printf("  %s\n", r)
 		}
 		return nil
 	}
 
-	doImages, doCheck, doDeep, doCache, doScopes := cleanCategories(*images, *check, *deep, *cacheGC, *scopes)
+	plan, perr := cleanCategories(f.named())
+	if perr != nil {
+		return perr
+	}
 
 	// Two independent capabilities are needed per category, and only the categories that use them
 	// pay for them:
 	//
 	//   * the loader-resolved keep-defaults — only `--images` and `--check` (and `--deep`, which
 	//     resolves them for the report's counts). Resolved PLUGIN-SIDE through the in-proc reverse
-	//     channel, so those three need compiled-in placement; `--cache` and `--scopes` do not.
+	//     channel, so those three need compiled-in placement; `--cache`, `--scopes` and
+	//     `--build-cache` do not.
 	//   * the container engine — only the categories that touch the container store: `--images`,
 	//     `--deep` and `--invalidate`/`list`. The engine is resolved INSIDE runRetentionOutcome for
-	//     exactly those, so `--cache`, `--check` and `--scopes` run on a host whose podman is absent
-	//     or broken, which is the state a host with a hung build scope is most likely to be in.
+	//     exactly those, so `--cache`, `--check`, `--scopes` and `--build-cache` run on a host whose
+	//     podman is absent or broken, which is the state a host with a hung build scope is most
+	//     likely to be in.
 	var keepImages, keepCheck int
-	if doImages || doCheck || doDeep {
+	if plan.images || plan.check || plan.deep {
 		var derr error
 		keepImages, keepCheck, derr = resolveRetentionDefaults(ctx, exec, dir)
 		if derr != nil {
 			return derr
 		}
 	}
-	if doImages || doCheck || doDeep || doCache || doScopes {
+	if plan.any() {
 		out := runRetentionOutcome(spec.RetentionRequest{
-			Dir: dir, DryRun: *dryRun, Images: doImages, Check: doCheck, Deep: doDeep, Cache: doCache,
-			Keep: *keep, KeepImages: keepImages, KeepCheckRuns: keepCheck,
-		}, doScopes)
+			Dir: dir, DryRun: f.dryRun, Images: plan.images, Check: plan.check, Deep: plan.deep, Cache: plan.cache,
+			Keep: f.keep, KeepImages: keepImages, KeepCheckRuns: keepCheck,
+		}, plan)
 		if out.Reply.Error != "" {
 			return fmt.Errorf("%s", out.Reply.Error)
 		}
-		if perr := printRetentionResult(os.Stdout, tag, doImages, doCheck, doDeep, doCache, doScopes, out); perr != nil {
-			return perr
+		if rerr := printRetentionResult(os.Stdout, tag, plan, out); rerr != nil {
+			return rerr
 		}
 	}
 	return nil
@@ -114,10 +164,10 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 // to raw `podman rmi -f`, which deletes the build-layer cache that makes the next build ~8x faster.
 // So each guarded category now prints the engine's SKIP line — naming the cause and the in-flight
 // build count — IN PLACE OF its removed count whenever the engine reports a skip.
-func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, doCache, doScopes bool, out retentionOutcome) error {
+func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retentionOutcome) error {
 	reply := out.Reply
 	var lines []string
-	if doImages {
+	if plan.images {
 		lines = append(lines, fmt.Sprintf("images: %s %d tag(s) (keep_images=%d)\n", tag, len(reply.ImageRefs), reply.KeepImages))
 		for _, r := range reply.ImageRefs {
 			lines = append(lines, fmt.Sprintf("  %s\n", r))
@@ -134,24 +184,24 @@ func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, do
 			lines = append(lines, fmt.Sprintf("  %s\n", p))
 		}
 	}
-	if doCheck {
+	if plan.check {
 		lines = append(lines, fmt.Sprintf("check: %s %d run artifact(s) (keep_check_runs=%d, NOTES.md preserved)\n", tag, len(reply.CheckPaths), reply.KeepCheckRuns))
 		for _, p := range reply.CheckPaths {
 			lines = append(lines, fmt.Sprintf("  %s\n", p))
 		}
 	}
-	if doDeep {
+	if plan.deep {
 		count := fmt.Sprintf("%s %d untagged image(s) store-wide (up to %s reclaimable — shared layers may reduce actual reclaim; pair with --invalidate for the fullest reclaim)", tag, len(reply.DeepIDs), kit.HumanBytes(reply.DeepBytes))
 		lines = append(lines, sweepLines("deep", out.DeepSkip, count, reply.DeepIDs)...)
 	}
-	if doScopes {
+	if plan.scopes {
 		// The scope reaper's count line names the guard's own age bound, so a reader can tell
 		// "nothing is hung" from "nothing is old enough to judge" without reading the flag help.
 		lines = append(lines, sweepLines("scopes", out.ScopeSkip,
 			fmt.Sprintf("%s %d hung transient build scope(s) (active > %s, no live builder)",
 				tag, len(out.Scopes), buildScopeMaxAge), out.Scopes)...)
 	}
-	if doCache {
+	if plan.cache {
 		if len(reply.CacheStores) == 0 {
 			lines = append(lines, "cache: no named cache stores found\n")
 		}
@@ -171,10 +221,85 @@ func printRetentionResult(w io.Writer, tag string, doImages, doCheck, doDeep, do
 			}
 		}
 	}
+	if plan.buildCache {
+		lines = append(lines, buildCacheLines(tag, out.BuildCache)...)
+	}
 	if _, err := fmt.Fprint(w, strings.Join(lines, "")); err != nil {
 		return fmt.Errorf("printing the clean report: %w", err)
 	}
 	return nil
+}
+
+// buildCacheLines renders the `--build-cache` section: ONE line per root, each carrying its own
+// status and its own byte figure.
+//
+// The live store and every quarantined corpse fail INDEPENDENTLY — a live root held by a running
+// daemon says nothing about the corpse beside it, and a corpse this user cannot delete says
+// nothing about the live store — so a single category count would have to lie about at least one
+// of them. The live root therefore carries its own line, and the quarantined roots share a count
+// line plus one status line each.
+func buildCacheLines(tag string, roots []buildCacheRootOutcome) []string {
+	// Never a silent blank: the engine returns one entry per root it examined, so an empty slice
+	// means the category reported nothing, which is a defect worth seeing rather than a blank.
+	if len(roots) == 0 {
+		return []string{"build-cache: no root reported\n"}
+	}
+	var lines []string
+	for _, r := range roots {
+		if r.Quarantined {
+			continue
+		}
+		text, _ := buildCacheRootStatus(tag, r)
+		lines = append(lines, "build-cache live: "+text+"\n")
+	}
+	// The quarantined roots accumulate into ONE count line, and each status line follows it — the
+	// summary always precedes the lines it summarizes, so a reader scanning the section in order is
+	// never told the total before the verdict that produced it.
+	var deadLines []string
+	dead, deadRemoved := 0, 0
+	var deadBytes int64
+	for _, r := range roots {
+		if !r.Quarantined {
+			continue
+		}
+		text, reclaimed := buildCacheRootStatus(tag, r)
+		deadLines = append(deadLines, "  "+text+"\n")
+		dead++
+		if reclaimed {
+			deadRemoved++
+			deadBytes += r.Bytes
+		}
+	}
+	if dead == 0 {
+		lines = append(lines, "build-cache dead: no quarantined root(s) found\n")
+	} else {
+		lines = append(lines, fmt.Sprintf("build-cache dead: %s %d quarantined root(s) (%s)\n",
+			tag, deadRemoved, kit.HumanBytes(deadBytes)))
+		lines = append(lines, deadLines...)
+	}
+	return lines
+}
+
+// buildCacheRootStatus is ONE root's status text and whether that status counts as reclaimed (a
+// real removal, or a would-remove under --dry-run). The four states are exclusive and EVERY one is
+// printed — absent, skipped by the lock guard, blocked by file ownership, reclaimed — because the
+// value of this report is the root it tells the operator to leave alone as much as the bytes it
+// reports.
+func buildCacheRootStatus(tag string, r buildCacheRootOutcome) (string, bool) {
+	switch {
+	case !r.Present:
+		return fmt.Sprintf("absent at %s (nothing to remove)", r.Dir), false
+	case r.Skip != nil:
+		return r.Skip.String(), false
+	case r.Blocker != "":
+		// Present tense on purpose: "cannot be removed" and "the tree is left whole" are true
+		// under --dry-run AND after a real run, so the line never claims an action that did not
+		// happen.
+		return fmt.Sprintf("cannot be removed — %s holds %s and %s; the tree is left whole",
+			r.Dir, kit.HumanBytes(r.Bytes), r.Blocker), false
+	default:
+		return fmt.Sprintf("%s %s (%s)", tag, r.Dir, kit.HumanBytes(r.Bytes)), true
+	}
 }
 
 // sweepLines renders ONE live-build-guarded sweep's report lines: the explicit SKIP line when the
@@ -189,34 +314,6 @@ func sweepLines(label string, skip *retentionSkip, count string, items []string)
 		lines = append(lines, fmt.Sprintf("  %s\n", item))
 	}
 	return lines
-}
-
-// cleanCategories resolves the --images/--check/--deep/--cache/--scopes flags into which categories
-// run this invocation. --images and --check keep their pre-existing "only this" semantics (any one
-// given alone suppresses the other default categories). --deep joins that same "explicit category"
-// gate but NEVER fires implicitly: on a plain `charly clean` (no flags at all) doDeep is always
-// false — the store-wide untagged-image sweep is a strictly broader operation than the default
-// per-charly-labeled retention (it can remove far more, and scans the whole local store), so it
-// stays opt-in-only. Passing --deep alone runs ONLY the deep category (mirroring --invalidate's
-// "runs ONLY this"); combine it with --images/--check to run more than one category in one
-// invocation.
-//
-// --scopes is the one category that runs BOTH by default AND with --deep, and the reason is
-// asymmetry of harm rather than of breadth: the reaper is safe by construction (build-scope family
-// + active for at least buildScopeMaxAge + no live builder process anywhere + charly's own
-// live-build lock held), while what it prevents is NOT a disk-footprint problem but a whole-host
-// one — opencharly/plugin-clean#11 measured a single orphaned build scope spinning for SEVEN DAYS
-// at 309% CPU and 12.27 load on 16 cores, starving every bed on the host. A hung scope is also the
-// one leftover `charly clean` had no category for at all. `--scopes` alone runs ONLY the scope
-// category; any other explicit category suppresses it, like every other category here.
-func cleanCategories(images, check, deep, cacheGC, scopes bool) (doImages, doCheck, doDeep, doCache, doScopes bool) {
-	anyCategory := images || check || deep || cacheGC || scopes
-	doImages = images || !anyCategory
-	doCheck = check || !anyCategory
-	doDeep = deep
-	doCache = cacheGC
-	doScopes = scopes || deep || !anyCategory
-	return doImages, doCheck, doDeep, doCache, doScopes
 }
 
 // resolveRetentionDefaults resolves defaults.keep_images/keep_check_runs PLUGIN-SIDE via the

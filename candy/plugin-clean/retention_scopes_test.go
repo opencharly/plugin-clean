@@ -240,7 +240,7 @@ func TestPrintRetentionResult_ScopesCategory(t *testing.T) {
 	t.Run("count and units", func(t *testing.T) {
 		out := retentionOutcome{Scopes: []string{"runc-buildah-buildahHUNG.scope"}}
 		var sb strings.Builder
-		if err := printRetentionResult(&sb, "would remove", false, false, false, false, true, out); err != nil {
+		if err := printRetentionResult(&sb, "would remove", cleanPlan{scopes: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		want := "scopes: would remove 1 hung transient build scope(s) (active > 1h0m0s, no live builder)\n" +
@@ -253,7 +253,7 @@ func TestPrintRetentionResult_ScopesCategory(t *testing.T) {
 	t.Run("a guard's decline replaces the count", func(t *testing.T) {
 		out := retentionOutcome{Scopes: []string{"runc-buildah-buildahHUNG.scope"}, ScopeSkip: &retentionSkip{reason: skipReasonScopesNoSystemd}}
 		var sb strings.Builder
-		if err := printRetentionResult(&sb, "removed", false, false, false, false, true, out); err != nil {
+		if err := printRetentionResult(&sb, "removed", cleanPlan{scopes: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := sb.String()
@@ -267,7 +267,7 @@ func TestPrintRetentionResult_ScopesCategory(t *testing.T) {
 }
 
 // TestReapBuildScopes_DecisionIsUnreachableFromTheWireRequest states the boundary the `scopes`
-// category must respect: `runRetentionOutcome(req, false)` — the form every PEER caller and the
+// category must respect: `runRetentionOutcome(req, cleanPlan{})` — the form every PEER caller and the
 // verb:retention wire entry reach — must never stop a host scope, however the request is filled.
 // A peer's post-build/post-run prune reaping the systemd scopes of the host it happens to run on
 // would be a capability leak with a host-level blast radius.
@@ -287,7 +287,7 @@ func TestReapBuildScopes_DecisionIsUnreachableFromTheWireRequest(t *testing.T) {
 		return []buildScope{{Unit: "runc-buildah-buildahHUNG.scope", AgeSeconds: 7 * 24 * 3600}}, nil
 	}
 
-	out := runRetentionOutcome(spec.RetentionRequest{Cache: true}, false)
+	out := runRetentionOutcome(spec.RetentionRequest{Cache: true}, cleanPlan{})
 	if len(out.Scopes) != 0 || len(stopped) != 0 {
 		t.Fatalf("the wire form stopped a scope: scopes=%v stopped=%v", out.Scopes, stopped)
 	}
@@ -322,7 +322,7 @@ func TestScopesOnlyRunNeedsNoEngine(t *testing.T) {
 	}
 
 	// The scopes-only run must reap WITHOUT ever resolving an engine.
-	out := runRetentionOutcome(spec.RetentionRequest{DryRun: true}, true)
+	out := runRetentionOutcome(spec.RetentionRequest{DryRun: true}, cleanPlan{scopes: true})
 	if out.Reply.Error != "" {
 		t.Fatalf("a scopes-only run failed on engine resolution: %s", out.Reply.Error)
 	}
@@ -335,7 +335,7 @@ func TestScopesOnlyRunNeedsNoEngine(t *testing.T) {
 
 	// The negative control: an images-only run DOES need it, and a host without it must fail loudly
 	// rather than silently prune nothing.
-	img := runRetentionOutcome(spec.RetentionRequest{Images: true, DryRun: true}, false)
+	img := runRetentionOutcome(spec.RetentionRequest{Images: true, DryRun: true}, cleanPlan{})
 	if img.Reply.Error == "" || resolved != 1 {
 		t.Fatalf("an images-only run must resolve the engine and fail on its absence: err=%q resolved=%d",
 			img.Reply.Error, resolved)

@@ -147,7 +147,7 @@ func TestCleanReportPrintsTheRetiredRoots(t *testing.T) {
 		{Name: "images", Dir: "/cache/images", Reason: "r", Migration: "m"},
 	}}
 	var sb strings.Builder
-	if err := printRetentionResult(&sb, "would reclaim", false, false, false, true, false, dry); err != nil {
+	if err := printRetentionResult(&sb, "would reclaim", cleanPlan{cache: true}, dry); err != nil {
 		t.Fatalf("printRetentionResult(dry): %v", err)
 	}
 	got := sb.String()
@@ -161,7 +161,7 @@ func TestCleanReportPrintsTheRetiredRoots(t *testing.T) {
 		{Name: "images", Dir: "/cache/images", Bytes: 2048, Present: true, Removed: true, Reason: "r", Migration: "m"},
 	}}
 	sb.Reset()
-	if err := printRetentionResult(&sb, "reclaimed", false, false, false, true, false, real); err != nil {
+	if err := printRetentionResult(&sb, "reclaimed", cleanPlan{cache: true}, real); err != nil {
 		t.Fatalf("printRetentionResult(real): %v", err)
 	}
 	if got := sb.String(); !strings.Contains(got, "cache retired images: reclaimed 2.0 KiB") {
