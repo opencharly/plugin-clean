@@ -88,11 +88,11 @@ func TestGCCacheStoresReachesTheStorekitRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gcCacheStores(dry): %v", err)
 	}
-	if len(dry) != 1 || dry[0].Name != "storekit-store" {
+	if len(dry) != 1 || dry[0].Info.Name != "storekit-store" {
 		t.Fatalf("stores = %+v, want exactly [storekit-store] from the cache root", dry)
 	}
-	if dry[0].Entries != 1 {
-		t.Fatalf("Entries = %d, want 1 (only the current entry is in the index)", dry[0].Entries)
+	if dry[0].Info.Entries != 1 {
+		t.Fatalf("Entries = %d, want 1 (only the current entry is in the index)", dry[0].Info.Entries)
 	}
 	// TWO blobs, not one, and the count is the LESS interesting half of it: a re-put
 	// orphans the superseded PAYLOAD and the superseded ENTRY MANIFEST, because the
@@ -101,11 +101,11 @@ func TestGCCacheStoresReachesTheStorekitRoot(t *testing.T) {
 	// is the old manifest. Asserting the payload's bytes are INCLUDED rather than
 	// equal to the total states the property without hard-coding the manifest's size,
 	// which is a detail of storekit's own encoding.
-	if dry[0].RemovedBlobs != 2 {
-		t.Fatalf("RemovedBlobs = %d, want 2 (the superseded payload AND its manifest)", dry[0].RemovedBlobs)
+	if dry[0].Info.RemovedBlobs != 2 {
+		t.Fatalf("RemovedBlobs = %d, want 2 (the superseded payload AND its manifest)", dry[0].Info.RemovedBlobs)
 	}
-	if dry[0].RemovedBytes < int64(len("the-superseded-payload")) {
-		t.Fatalf("RemovedBytes = %d, want at least the payload's %d", dry[0].RemovedBytes, len("the-superseded-payload"))
+	if dry[0].Info.RemovedBytes < int64(len("the-superseded-payload")) {
+		t.Fatalf("RemovedBytes = %d, want at least the payload's %d", dry[0].Info.RemovedBytes, len("the-superseded-payload"))
 	}
 	// A dry run touches nothing: the superseded blob is still on disk.
 	if _, err := os.Stat(filepath.Join(s.Dir(), "blobs", "sha256", digestHex(oldDigest))); err != nil {
@@ -118,7 +118,7 @@ func TestGCCacheStoresReachesTheStorekitRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gcCacheStores: %v", err)
 	}
-	if len(real) != 1 || real[0].RemovedBlobs != dry[0].RemovedBlobs || real[0].RemovedBytes != dry[0].RemovedBytes {
+	if len(real) != 1 || real[0].Info.RemovedBlobs != dry[0].Info.RemovedBlobs || real[0].Info.RemovedBytes != dry[0].Info.RemovedBytes {
 		t.Fatalf("real = %+v, dry-run = %+v: the two must agree", real, dry)
 	}
 	if _, err := os.Stat(filepath.Join(s.Dir(), "blobs", "sha256", digestHex(oldDigest))); !os.IsNotExist(err) {

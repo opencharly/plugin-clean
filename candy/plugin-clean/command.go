@@ -205,12 +205,12 @@ func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retention
 		lines = append(lines, storeLines(out.Store)...)
 	}
 	if plan.cache {
-		if len(reply.CacheStores) == 0 {
+		if len(out.CacheSweep) == 0 {
 			lines = append(lines, "cache: no named cache stores found\n")
 		}
-		for _, s := range reply.CacheStores {
-			lines = append(lines, fmt.Sprintf("cache %s: %d live entry(ies); %s %d unreferenced blob(s) (%s)\n",
-				s.Name, s.Entries, tag, s.RemovedBlobs, kit.HumanBytes(s.RemovedBytes)))
+		for _, s := range out.CacheSweep {
+			lines = append(lines, fmt.Sprintf("cache %s (%s): %d live entry(ies); %s %d unreferenced blob(s) (%s)\n",
+				s.Info.Name, s.Reader, s.Info.Entries, tag, s.Info.RemovedBlobs, kit.HumanBytes(s.Info.RemovedBytes)))
 		}
 		// The retired roots, reported even when there is nothing to remove: "already gone" and
 		// "never existed" are the states a re-run reaches, and a silent omission would read as a

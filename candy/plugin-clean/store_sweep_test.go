@@ -8,11 +8,13 @@ package clean
 // writes nothing outside its own temporary directory (D-STORE-8).
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -572,74 +574,146 @@ func TestClassifierRoutesEachStoreByItsOwnIndex(t *testing.T) {
 	})
 }
 
-// TestCleanCacheImageStoreSurvivesTheOneRootOverride is opencharly/plugin-clean#27: with
-// CHARLY_CACHE_DIR set — the one override D-STORE-1 blesses, and how a bed isolates its cache — the
-// two store roots coincide, and a real `charly clean --cache` must NOT hand the image store to the
-// image-blind `spec/cache` reader. Every blob the entry reaches must survive, and `Lookup` must
-// still resolve to content that exists.
-//
-// FAILS WITHOUT THE FIX (measured by mutating the router back to the two-half form): the sweep
-// removes the manifest, the config and the layer, leaves one blob and leaves the entry answering
-// `Lookup(ref)` for bytes that are gone.
-func TestCleanCacheImageStoreSurvivesTheOneRootOverride(t *testing.T) {
-	root := t.TempDir()
+// coincidentRootImageStore is the fixture opencharly/plugin-clean#27's tests share: a cache root
+// where the two store roots COINCIDE (CHARLY_CACHE_DIR is D-STORE-1's one override, and under the
+// one resolver that is every host), holding one storekit image entry with the blobs a build
+// produces and the reference it was built as.
+func coincidentRootImageStore(t *testing.T) (root, ref, key string, blobs []string) {
+	t.Helper()
+	root = t.TempDir()
 	t.Setenv("CHARLY_CACHE_DIR", root)
-
-	key, _ := putImageEntry(t, root, "localhost/w36-named-live:2026.296.1200", "2026-10-23T12:00:00Z", "the layer of a live image")
+	ref = "localhost/w36-named-live:2026.296.1200"
+	key, blobs = putImageEntry(t, root, ref, "2026-10-23T12:00:00Z", "the layer of a live image")
 	store := storekit.OpenStoreDir(filepath.Join(root, storekit.ImageStoreName))
-	entry, err := store.ReadEntry(key)
-	if err != nil {
-		t.Fatalf("ReadEntry: %v", err)
-	}
-	// What the entry reaches, spelled out from the fixture: layer, config, manifest, index, and the
-	// entry manifest itself (whose digest PutEntry returns).
-	blobs, err := store.Blobs()
-	if err != nil {
-		t.Fatalf("Blobs: %v", err)
-	}
-	if len(blobs) < 5 {
-		t.Fatalf("fixture is wrong: %d blob(s), want at least the 5 an image entry reaches", len(blobs))
-	}
 	if unreferenced, uerr := store.UnreferencedBlobs(); uerr != nil || len(unreferenced) != 0 {
 		t.Fatalf("fixture is wrong: the store reports %d unreferenced blob(s) (%v) before any sweep", len(unreferenced), uerr)
 	}
+	return root, ref, key, blobs
+}
 
-	// A REAL run of the cache category — not a dry run, which the issue measures as predicting the
-	// same destruction.
-	infos, refused, err := gcCacheStores(false)
+// imageStoreTree lists a store directory's IMMEDIATE entries, sorted — the set D-STORE-3
+// (DESIGN.md:2484) constrains: "a store tree is that layout and nothing else — no `.lock`, no
+// `locks/`, and no sidecar file of any kind".
+func imageStoreTree(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the store tree %s: %v", dir, err)
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	slices.Sort(names)
+	return names
+}
+
+// TestCleanCacheSweepsTheImageStoreWithItsOwnReader is opencharly/plugin-clean#27's FIRST effect:
+// with CHARLY_CACHE_DIR set (the two roots coincide), a real `charly clean --cache` must leave
+// every blob the surviving entry reaches still present — and leave a store tree that is the layout
+// and NOTHING else, because the reader that swept it was storekit, which keeps its index lock in
+// the runtime root, rather than `spec/cache`, whose `GCStats` writes `.lock` INSIDE the tree.
+//
+// The reader is asserted on the ROUTER (`discoverStores`), not inferred from the outcome: an
+// assertion that only counted blobs would go green if a future refactor routed the store to a
+// third, harmless reader, and an assertion that only the report was right would go green while
+// the wrong reader deleted bytes under it.
+//
+// FAILS WITHOUT THE FIX (mutation: route every store to the image-blind reader): the store loses 4
+// of its 5 blobs and the tree gains a `.lock`, which is the measurement in the issue.
+func TestCleanCacheSweepsTheImageStoreWithItsOwnReader(t *testing.T) {
+	root, _, _, blobs := coincidentRootImageStore(t)
+	dir := filepath.Join(root, storekit.ImageStoreName)
+
+	stores, err := discoverStores()
+	if err != nil {
+		t.Fatalf("discoverStores: %v", err)
+	}
+	var found *discoveredStore
+	for i := range stores {
+		if stores[i].Name == storekit.ImageStoreName {
+			found = &stores[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("the image store is not in the inventory: %+v", stores)
+	}
+	if found.Reader != storeReaderStorekit {
+		t.Fatalf("the image store at %s is routed to %s — only storekit can read an entry manifest", found.Dir, found.Reader)
+	}
+
+	// A REAL run — not a dry run, which the issue measures as predicting the same destruction.
+	out, refused, err := gcCacheStores(false)
 	if err != nil {
 		t.Fatalf("gcCacheStores: %v", err)
 	}
 	if len(refused) != 0 {
 		t.Fatalf("refused = %+v, want none", refused)
 	}
-	if len(infos) != 1 || infos[0].Name != storekit.ImageStoreName {
-		t.Fatalf("stores = %+v, want the one image store", infos)
+	if len(out) != 1 || out[0].Info.Name != storekit.ImageStoreName {
+		t.Fatalf("stores = %+v, want the one image store", out)
 	}
-	if infos[0].RemovedBlobs != 0 || infos[0].RemovedBytes != 0 {
-		t.Fatalf("the image store lost %d blob(s) (%d B): nothing it holds was unreferenced",
-			infos[0].RemovedBlobs, infos[0].RemovedBytes)
+	if out[0].Reader != storeReaderStorekit {
+		// The tree is in the message because the WRONG reader's second effect is the D-STORE-3 one:
+		// `spec/cache` writes `.lock` inside the store it sweeps.
+		t.Fatalf("the report says %s swept the image store, want storekit; its tree is now %v", out[0].Reader, imageStoreTree(t, dir))
+	}
+	if out[0].Info.RemovedBlobs != 0 || out[0].Info.RemovedBytes != 0 {
+		// The tree is named in the SAME message because #27 recorded two effects of one cause, and a
+		// failure that only counted blobs would leave the D-STORE-3 half unproven.
+		t.Fatalf("the image store lost %d blob(s) (%d B) and its tree is now %v: nothing it holds was unreferenced, and a store tree carries no lock and no sidecar (D-STORE-3)",
+			out[0].Info.RemovedBlobs, out[0].Info.RemovedBytes, imageStoreTree(t, dir))
 	}
 	for _, d := range blobs {
 		if !blobPresent(t, root, d) {
 			t.Fatalf("blob %s was destroyed by the cache sweep", d)
 		}
 	}
-	// And the reference still answers with content that exists — THE tell of the defect: the store
-	// used to keep answering `Lookup(ref) = (digest, true)` for a digest whose bytes were gone.
+	if got, want := imageStoreTree(t, dir), []string{"blobs", "index.json", "oci-layout"}; !slices.Equal(got, want) {
+		t.Fatalf("the store tree is %v, want exactly %v — a store tree carries no lock and no sidecar (D-STORE-3)", got, want)
+	}
+}
+
+// TestCleanCacheLookupResolvesToExistingContent is opencharly/plugin-clean#27's SECOND, sharper
+// tell: after the sweep the store must not still ANSWER for bytes that are gone. The defect left
+// `Lookup(ref) = (digest, true)` over a digest whose manifest, config and layers had been deleted,
+// so every later consumer resolved through the entry to nothing. This asserts the positive the
+// defect cannot satisfy — the resolved digest's own payload still reads back — which is why the
+// two tests are a PAIR and not one: the blob count can be right while the reference is dead, and
+// the reference can be live while bytes are missing from the graph.
+//
+// FAILS WITHOUT THE FIX (same mutation): `Lookup` still returns `true`, and this test fails on the
+// READ, naming the digest that no longer exists.
+func TestCleanCacheLookupResolvesToExistingContent(t *testing.T) {
+	root, ref, key, _ := coincidentRootImageStore(t)
+
+	if _, _, err := gcCacheStores(false); err != nil {
+		t.Fatalf("gcCacheStores: %v", err)
+	}
+	store := storekit.OpenStoreDir(filepath.Join(root, storekit.ImageStoreName))
 	img, err := storekit.OpenImageStore()
 	if err != nil {
 		t.Fatalf("OpenImageStore: %v", err)
 	}
-	dgst, ok, lerr := img.Lookup("localhost/w36-named-live:2026.296.1200")
+	dgst, ok, lerr := img.Lookup(ref)
 	if lerr != nil || !ok {
-		t.Fatalf("Lookup = %q, %v, %v; want the entry to resolve", dgst, ok, lerr)
+		t.Fatalf("Lookup(%q) = %q, %v, %v; want the entry to resolve", ref, dgst, ok, lerr)
+	}
+	if dgst != key {
+		t.Fatalf("Lookup(%q) = %s, want the entry's key %s", ref, shortDigest(dgst), shortDigest(key))
 	}
 	if _, rerr := store.ReadBlob(dgst); rerr != nil {
-		t.Fatalf("the entry resolves to a payload that no longer exists: %v", rerr)
+		t.Fatalf("the entry answers Lookup(%q) = %s but that payload no longer exists: %v — the tell of opencharly/plugin-clean#27", ref, shortDigest(dgst), rerr)
+	}
+	entry, rerr := store.ReadEntry(key)
+	if rerr != nil {
+		t.Fatalf("ReadEntry(%s): %v", shortDigest(key), rerr)
 	}
 	if entry.Payload == "" {
-		t.Fatal("fixture is wrong: the entry has no payload")
+		t.Fatal("the surviving entry has no payload")
+	}
+	if _, perr := store.ReadBlob(entry.Payload); perr != nil {
+		t.Fatalf("the surviving entry's payload does not read back: %v", perr)
 	}
 }
 
@@ -661,6 +735,12 @@ func TestCleanCacheRefusesAStoreItCannotClassify(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.json"), []byte(idx), 0o644); err != nil {
 		t.Fatalf("index: %v", err)
 	}
+	// REAL bytes in the refused store: "nothing was swept" has to be observable, or the refusal is
+	// a line the sweep prints while deleting anyway.
+	refusedBlob := filepath.Join(dir, "blobs", "sha256", "aa")
+	if err := os.WriteFile(refusedBlob, []byte("the refused store's bytes"), 0o644); err != nil {
+		t.Fatalf("refused blob: %v", err)
+	}
 
 	infos, refused, err := gcCacheStores(false)
 	if err != nil {
@@ -674,5 +754,22 @@ func TestCleanCacheRefusesAStoreItCannotClassify(t *testing.T) {
 	}
 	if !strings.Contains(refused[0].Reason, "mixes") {
 		t.Fatalf("reason = %q, want it to say the index mixes media types", refused[0].Reason)
+	}
+	// Not a byte removed from it.
+	if _, serr := os.Stat(refusedBlob); serr != nil {
+		t.Fatalf("a REFUSED store lost bytes: %v", serr)
+	}
+	// And the REPORT carries the refusal by name, not only the Go value: an operator reading
+	// `charly clean --cache` must see which store was left alone and why.
+	var buf bytes.Buffer
+	if perr := printRetentionResult(&buf, "removed", cleanPlan{cache: true}, retentionOutcome{CacheSweep: infos, RefusedStores: refused}); perr != nil {
+		t.Fatalf("printRetentionResult: %v", perr)
+	}
+	line := buf.String()
+	if !strings.Contains(line, "cache mixed: REFUSED at "+dir) {
+		t.Fatalf("the report does not name the refused store:\n%s", line)
+	}
+	if !strings.Contains(line, "mixes") {
+		t.Fatalf("the report does not carry the refusal reason:\n%s", line)
 	}
 }

@@ -305,17 +305,26 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 func TestPrintRetentionResult_CacheCategory(t *testing.T) {
 	t.Run("named stores", func(t *testing.T) {
 		var buf bytes.Buffer
-		out := retentionOutcome{Reply: spec.RetentionReply{CacheStores: []spec.CacheStoreInfo{
-			{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20},
-			{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0},
-		}}}
+		out := retentionOutcome{
+			Reply: spec.RetentionReply{CacheStores: []spec.CacheStoreInfo{
+				{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20},
+				{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0},
+			}},
+			// The READER that swept each store travels beside the wire row: after
+			// opencharly/plugin-clean#27 a store swept by the wrong reader looked exactly like one
+			// swept by the right one, so the report names it.
+			CacheSweep: []cacheStoreOutcome{
+				{Info: spec.CacheStoreInfo{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20}, Reader: storeReaderStorekit},
+				{Info: spec.CacheStoreInfo{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0}, Reader: storeReaderSpecCache},
+			},
+		}
 		if err := printRetentionResult(&buf, "removed", cleanPlan{cache: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := buf.String()
 		for _, want := range []string{
-			"cache project: 7 live entry(ies); removed 3 unreferenced blob(s)",
-			"cache materialized: 2 live entry(ies); removed 0 unreferenced blob(s)",
+			"cache project (storekit): 7 live entry(ies); removed 3 unreferenced blob(s)",
+			"cache materialized (spec/cache): 2 live entry(ies); removed 0 unreferenced blob(s)",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("output missing %q:\n%s", want, got)

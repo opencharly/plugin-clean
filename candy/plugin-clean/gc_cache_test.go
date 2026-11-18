@@ -35,10 +35,10 @@ func TestGCCacheStores(t *testing.T) {
 	if len(refused) != 0 {
 		t.Fatalf("refused = %+v, want none: both stores are spec/cache layouts", refused)
 	}
-	if len(dry) != 2 || dry[0].Name != "materialized" || dry[1].Name != "project" {
+	if len(dry) != 2 || dry[0].Info.Name != "materialized" || dry[1].Info.Name != "project" {
 		t.Fatalf("stores = %+v, want [materialized project] sorted", dry)
 	}
-	if dry[1].Entries != 1 || dry[1].RemovedBlobs == 0 || dry[1].RemovedBytes == 0 {
+	if dry[1].Info.Entries != 1 || dry[1].Info.RemovedBlobs == 0 || dry[1].Info.RemovedBytes == 0 {
 		t.Fatalf("project store dry-run = %+v, want 1 entry + a reported reclaim", dry[1])
 	}
 	// The store is untouched (the live entry is still there).
@@ -51,8 +51,8 @@ func TestGCCacheStores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gcCacheStores: %v", err)
 	}
-	if real[1].RemovedBlobs != dry[1].RemovedBlobs {
-		t.Fatalf("real removed %d blobs, dry-run predicted %d", real[1].RemovedBlobs, dry[1].RemovedBlobs)
+	if real[1].Info.RemovedBlobs != dry[1].Info.RemovedBlobs {
+		t.Fatalf("real removed %d blobs, dry-run predicted %d", real[1].Info.RemovedBlobs, dry[1].Info.RemovedBlobs)
 	}
 	if _, ok := cache.OpenNamedLayout("project").Get("k"); !ok {
 		t.Fatal("GC must keep the live entry")

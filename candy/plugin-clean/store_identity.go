@@ -43,6 +43,7 @@ import (
 
 	"github.com/opencharly/sdk/storekit"
 	"github.com/opencharly/spec/cache"
+	"github.com/opencharly/spec/spec"
 )
 
 // The two descriptor media types that DECIDE a store's reader. `storekit.MediaTypeStoreEntry` is
@@ -269,6 +270,15 @@ func sweepStoreBlobs(s *storekit.Store, dryRun bool) (blobs int64, bytes int64, 
 		blobs++
 	}
 	return blobs, storekit.BlobBytes(cands), nil
+}
+
+// cacheStoreOutcome is ONE swept store: the WIRE-shaped report row PLUS the reader that swept it.
+// The reader travels with the row because "which reader touched this store" is the one fact a
+// reader of the report needs to trust the sweep after opencharly/plugin-clean#27 — a store swept by
+// the wrong reader looked exactly like a store swept by the right one, and the report said nothing.
+type cacheStoreOutcome struct {
+	Info   spec.CacheStoreInfo
+	Reader storeReader
 }
 
 // refusedStore is ONE named store the sweep declined to touch: its identity could not be decided

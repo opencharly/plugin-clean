@@ -104,6 +104,12 @@ type retentionOutcome struct {
 	// peer decodes for a reply no peer reads.
 	Store *storeSweepOutcome
 
+	// CacheSweep is the `cache` category's per-store outcome: the wire row (which rides on
+	// spec.RetentionReply.CacheStores, unchanged) PLUS the reader that swept it, which the report
+	// names — "swept by storekit" and "swept by spec/cache" are the two answers that made
+	// opencharly/plugin-clean#27 invisible.
+	CacheSweep []cacheStoreOutcome
+
 	// RefusedStores is the `cache` category's refusal list: named stores whose reader could not
 	// be decided from the store's own index. They are reported and left untouched, because a
 	// store swept by the wrong reader is how opencharly/plugin-clean#27 destroyed an image.
@@ -237,11 +243,15 @@ func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan) retentionOut
 		out.Store = store
 	}
 	if req.Cache {
-		stores, refused, cerr := gcCacheStores(req.DryRun)
+		sweep, refused, cerr := gcCacheStores(req.DryRun)
 		if cerr != nil {
 			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("GCing the cache stores: %v", cerr)}}
 		}
-		reply.CacheStores = stores
+		reply.CacheStores = make([]spec.CacheStoreInfo, 0, len(sweep))
+		for _, s := range sweep {
+			reply.CacheStores = append(reply.CacheStores, s.Info)
+		}
+		out.CacheSweep = sweep
 		out.RefusedStores = refused
 		// The SAME category, the OTHER instrument: GC reclaims unreferenced blobs inside live
 		// stores; this retires whole roots the migration record has retired (opencharly/
@@ -396,12 +406,12 @@ func treeBytes(dir string) int64 {
 // store tree — which is also why nothing here writes a `spec/cache` `.lock` into an image store
 // any more (D-STORE-3). An empty or absent root is an empty list, never an error. Read-only under
 // dryRun: both readers compute the same set without removing.
-func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, []refusedStore, error) {
+func gcCacheStores(dryRun bool) ([]cacheStoreOutcome, []refusedStore, error) {
 	stores, err := discoverStores()
 	if err != nil {
 		return nil, nil, err
 	}
-	var out []spec.CacheStoreInfo
+	var out []cacheStoreOutcome
 	var refused []refusedStore
 	for _, st := range stores {
 		switch st.Reader {
@@ -415,11 +425,14 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, []refusedStore, error) {
 			if serr != nil {
 				return nil, refused, fmt.Errorf("store %q: %w", st.Name, serr)
 			}
-			out = append(out, spec.CacheStoreInfo{
-				Name:         st.Name,
-				Entries:      int64(len(entries)),
-				RemovedBlobs: blobs,
-				RemovedBytes: bytes,
+			out = append(out, cacheStoreOutcome{
+				Info: spec.CacheStoreInfo{
+					Name:         st.Name,
+					Entries:      int64(len(entries)),
+					RemovedBlobs: blobs,
+					RemovedBytes: bytes,
+				},
+				Reader: st.Reader,
 			})
 		case storeReaderSpecCache:
 			l := cache.OpenLayout(st.Dir)
@@ -427,11 +440,14 @@ func gcCacheStores(dryRun bool) ([]spec.CacheStoreInfo, []refusedStore, error) {
 			if gerr != nil {
 				return nil, refused, fmt.Errorf("store %q: %w", st.Name, gerr)
 			}
-			out = append(out, spec.CacheStoreInfo{
-				Name:         st.Name,
-				Entries:      int64(l.Len()),
-				RemovedBlobs: int64(reclaim.RemovedBlobs),
-				RemovedBytes: reclaim.RemovedBytes,
+			out = append(out, cacheStoreOutcome{
+				Info: spec.CacheStoreInfo{
+					Name:         st.Name,
+					Entries:      int64(l.Len()),
+					RemovedBlobs: int64(reclaim.RemovedBlobs),
+					RemovedBytes: reclaim.RemovedBytes,
+				},
+				Reader: st.Reader,
 			})
 		default:
 			refused = append(refused, refusedStore{Name: st.Name, Dir: st.Dir, Reason: st.Reason})
