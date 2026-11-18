@@ -333,3 +333,73 @@ func TestRetiredRootLegacyRowIsTheOnlyPlaceTheDataPathAppears(t *testing.T) {
 		}
 	}
 }
+
+// TestRetiredRootLegacyIngestRefusesAnIndexNamingNoEntries: an index that names nothing while the tree
+// holds blobs is content this ingest cannot account for — the blobs would be removed with no record of
+// what they were.
+func TestRetiredRootLegacyIngestRefusesAnIndexNamingNoEntries(t *testing.T) {
+	_, dataRoot := legacyRoots(t)
+	src := filepath.Join(dataRoot, "charly", "images")
+	blobsDir := filepath.Join(src, "blobs", "sha256")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "index.json"), []byte(`{"schemaVersion":2,"manifests":[]}`), 0o644); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	orphan := filepath.Join(blobsDir, strings.Repeat("d", 64))
+	if err := os.WriteFile(orphan, []byte("bytes nothing names"), 0o644); err != nil {
+		t.Fatalf("blob: %v", err)
+	}
+
+	_, err := sweepRetiredCacheRoots(false)
+	if err == nil {
+		t.Fatal("the sweep removed a legacy tree whose index named no entries")
+	}
+	if !strings.Contains(err.Error(), "names no entries") {
+		t.Fatalf("refusal = %q, want it to say the index names no entries", err)
+	}
+	if _, serr := os.Stat(orphan); serr != nil {
+		t.Fatalf("an unaccountable legacy tree lost bytes: %v", serr)
+	}
+}
+
+// TestRetiredRootLegacyIngestRefusesAMissingManifest: an index entry whose manifest blob is already
+// gone is a tree this ingest cannot faithfully re-publish; removing it afterwards would delete the only
+// record of an image that never made it across.
+func TestRetiredRootLegacyIngestRefusesAMissingManifest(t *testing.T) {
+	_, dataRoot := legacyRoots(t)
+	src, _ := legacyFixture(t, dataRoot, "ghcr.io/opencharly/arch:2026.322.1039")
+
+	raw, err := os.ReadFile(filepath.Join(src, "index.json"))
+	if err != nil {
+		t.Fatalf("read index: %v", err)
+	}
+	var idx struct {
+		Manifests []struct {
+			Digest string `json:"digest"`
+		} `json:"manifests"`
+	}
+	if uerr := json.Unmarshal(raw, &idx); uerr != nil {
+		t.Fatalf("parse index: %v", uerr)
+	}
+	if len(idx.Manifests) != 1 {
+		t.Fatalf("fixture is wrong: %d descriptor(s), want 1", len(idx.Manifests))
+	}
+	missing := idx.Manifests[0].Digest
+	blobPath := filepath.Join(src, "blobs", filepath.FromSlash(strings.Replace(missing, ":", "/", 1)))
+	if rerr := os.Remove(blobPath); rerr != nil {
+		t.Fatalf("remove the manifest blob: %v", rerr)
+	}
+
+	_, err = sweepRetiredCacheRoots(false)
+	if err == nil {
+		t.Fatal("the sweep ingested a tree whose indexed manifest it does not hold")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Fatalf("refusal = %q, want it to name the missing digest %s", err, missing)
+	}
+	if _, serr := os.Stat(src); serr != nil {
+		t.Fatalf("a refused legacy tree was removed: %v", serr)
+	}
+}
