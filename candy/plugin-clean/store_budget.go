@@ -13,10 +13,14 @@ package clean
 //	  store_budget:
 //	    bytes: 274877906944      # 256 GiB
 //
-// The field is declared in opencharly/spec (`#CleanSection` / `#StoreBudget`, spec#384) and arrives
-// here through `deploykit.DeployConfig` (a type ALIAS of `spec.DeployConfig`), so this file needs no
-// wire type, no new seam and no resolver of its own. `bytes` is `int & >0`, projected as `int64`
-// because 256 GiB does not fit a 32-bit `int` and the overflow on 386/arm would be a silent wrap.
+// The field is declared in opencharly/spec (`#CleanSection` / `#StoreBudget`, spec#384) and reaches this
+// file as `*spec.CleanSection`, read by `loaderkit.LoadHostCleanSectionViaExecutor` (sdk#566) — one call,
+// no wire type, no seam of this plugin's own. It did NOT arrive through `deploykit.DeployConfig`: that path
+// runs the section through `ProjectDeployConfig`, which drops it (see the note above the reader below), and
+// the resulting silent fallback is what put the reader in the SDK.
+//
+// `bytes` is `int & >0`, projected as `int64` because 256 GiB does not fit a 32-bit `int` and the overflow
+// on 386/arm would be a silent wrap.
 //
 // # Three states, and never a sentinel
 //
