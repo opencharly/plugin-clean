@@ -121,20 +121,20 @@ type storeIndexShape struct {
 // read) → unrouted, with the evidence in the reason. An ABSENT index is an empty store, not an
 // unreadable one: either reader's sweep over it is a no-op, so it is routed to storekit (whose
 // walk is the stricter of the two) rather than refused.
-func classifyStore(dir string) (storeReader, string, error) {
+func classifyStore(dir string) (storeReader, string) {
 	raw, err := os.ReadFile(filepath.Join(dir, indexFileName))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return storeReaderStorekit, "", nil
+			return storeReaderStorekit, ""
 		}
-		return storeReaderUnrouted, fmt.Sprintf("its index cannot be read: %v", err), nil
+		return storeReaderUnrouted, fmt.Sprintf("its index cannot be read: %v", err)
 	}
 	var idx storeIndexShape
 	if uerr := json.Unmarshal(raw, &idx); uerr != nil {
-		return storeReaderUnrouted, fmt.Sprintf("its index does not parse: %v", uerr), nil
+		return storeReaderUnrouted, fmt.Sprintf("its index does not parse: %v", uerr)
 	}
 	if len(idx.Manifests) == 0 {
-		return storeReaderStorekit, "", nil
+		return storeReaderStorekit, ""
 	}
 	entryManifests, imageManifests := 0, 0
 	unknown := map[string]int{}
@@ -150,17 +150,17 @@ func classifyStore(dir string) (storeReader, string, error) {
 	}
 	switch {
 	case entryManifests == len(idx.Manifests):
-		return storeReaderStorekit, "", nil
+		return storeReaderStorekit, ""
 	case imageManifests == len(idx.Manifests):
-		return storeReaderSpecCache, "", nil
+		return storeReaderSpecCache, ""
 	case len(unknown) > 0:
 		return storeReaderUnrouted, fmt.Sprintf(
 			"its index mixes descriptor media types this sweep has no reader for (%s); sweeping it with either reader could delete live bytes",
-			describeMediaTypes(unknown)), nil
+			describeMediaTypes(unknown))
 	default:
 		return storeReaderUnrouted, fmt.Sprintf(
 			"its index mixes storekit entry manifests (%d) with spec/cache manifests (%d), so neither reader knows the whole store",
-			entryManifests, imageManifests), nil
+			entryManifests, imageManifests)
 	}
 }
 
@@ -231,10 +231,7 @@ func discoverStores() ([]discoveredStore, error) {
 				continue
 			}
 			seen[key] = true
-			reader, reason, cerr := classifyStore(key)
-			if cerr != nil {
-				return nil, fmt.Errorf("classifying the store %s: %w", key, cerr)
-			}
+			reader, reason := classifyStore(key)
 			out = append(out, discoveredStore{Name: name, Dir: key, Reader: reader, Reason: reason})
 		}
 	}

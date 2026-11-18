@@ -315,18 +315,27 @@ func TestStoreSweepKeepsAnEntryReferencedByContentAddress(t *testing.T) {
 }
 
 // TestStoreSweepEvictsASupersededRebuildOfAReferencedRef pins the TAG → DIGEST resolution: the
-// state names a rolling tag, the store holds two builds under it, and the NEWEST is the one the
-// store resolves the name to — so the older build is reclaimable churn, not a live artifact.
+// state names ONE TAGGED reference, the store holds two builds under that annotation, and the
+// NEWEST is the one the store resolves the name to — so the older build is reclaimable churn, not a
+// live artifact.
+//
+// ⚑ Both sides carry a TAG here on purpose. The previous form of this test used an UNTAGGED
+// annotation on both sides, which is why it passed while `planStoreEviction` evicted a TAGGED entry
+// whose repository the state named bare — the hole the reviewer found. A bare-vs-bare fixture
+// cannot see that hole: with a bare state reference the bare-repository rule keeps every tag, and
+// the superseded path is never reached. The tagged form is what exercises Lookup; the tagged-entry
+// / bare-reference pair is TestStoreSweepKeepsEveryTagOfABareRepositoryReference's job.
 func TestStoreSweepEvictsASupersededRebuildOfAReferencedRef(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CHARLY_CACHE_DIR", root)
 	seamNoLiveBuild(t)
 
-	oldKey, _ := putImageEntry(t, root, "ghcr.io/opencharly/vision-gate", "2026-11-17T10:00:00Z", "old layer")
-	newKey, _ := putImageEntry(t, root, "ghcr.io/opencharly/vision-gate", "2026-11-18T10:00:00Z", "new layer")
+	const pinned = "ghcr.io/opencharly/vision-gate:2026.322.0001"
+	oldKey, _ := putImageEntry(t, root, pinned, "2026-11-17T10:00:00Z", "old layer")
+	newKey, _ := putImageEntry(t, root, pinned, "2026-11-18T10:00:00Z", "new layer")
 
 	units := t.TempDir()
-	quadletUnit(t, units, "gate", "ghcr.io/opencharly/vision-gate")
+	quadletUnit(t, units, "gate", pinned)
 	seamQuadlets(t, units)
 	seamEngine(t, nil, nil, nil)
 
@@ -342,6 +351,90 @@ func TestStoreSweepEvictsASupersededRebuildOfAReferencedRef(t *testing.T) {
 	}
 	if !strings.Contains(out.evicted()[0].Reason, "superseded") {
 		t.Fatalf("reason = %q, want it to say the entry was superseded", out.evicted()[0].Reason)
+	}
+}
+
+// TestStoreSweepKeepsEveryTagOfABareRepositoryReference is the reviewer's blocking finding made
+// falsifiable: a state surface that names a BARE repository — a quadlet's `Image=vision-gate`, or a
+// digest-only reference that `normImageRef` folds to a bare repository — must keep that repository's
+// TAGGED store entries. The entries here carry tags and the state names only the repository, which is
+// exactly the pair the old `if hasTag { continue }` branch evicted.
+//
+// FAILS WITHOUT THE FIX: both entries fall through to "unreferenced" and are evicted, i.e. a running
+// deployment's image is destroyed because the record that kept it carried no tag.
+func TestStoreSweepKeepsEveryTagOfABareRepositoryReference(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CHARLY_CACHE_DIR", root)
+	seamNoLiveBuild(t)
+
+	first, _ := putImageEntry(t, root, "ghcr.io/opencharly/vision-gate:2026.322.0001", "2026-11-17T10:00:00Z", "first layer")
+	second, _ := putImageEntry(t, root, "ghcr.io/opencharly/vision-gate:2026.323.0002", "2026-11-18T10:00:00Z", "second layer")
+
+	// The state names the REPOSITORY, not a build of it.
+	units := t.TempDir()
+	quadletUnit(t, units, "gate", "ghcr.io/opencharly/vision-gate")
+	seamQuadlets(t, units)
+	seamEngine(t, nil, nil, nil)
+
+	out, err := runStoreSweep("podman", false, 1<<40)
+	if err != nil {
+		t.Fatalf("runStoreSweep: %v", err)
+	}
+	if out.Evicted != 0 {
+		t.Fatalf("Evicted = %d, want 0: a bare-repository reference keeps every tag of it (evicted=%+v)", out.Evicted, out.evicted())
+	}
+	kept := map[string]bool{}
+	for _, d := range out.kept() {
+		kept[d.Key] = true
+	}
+	for _, want := range []string{first, second} {
+		if !kept[want] {
+			t.Fatalf("entry %s was not kept: kept=%+v", shortDigest(want), out.kept())
+		}
+		if !blobPresent(t, root, want) {
+			t.Fatalf("the referenced repository lost the bytes of %s", shortDigest(want))
+		}
+	}
+	if !strings.Contains(out.kept()[0].Reason, "names the repository") {
+		t.Fatalf("reason = %q, want it to say the state named the repository", out.kept()[0].Reason)
+	}
+}
+
+// TestStoreBlobBytesRefusesAnUnmeasurableStore: a store that cannot be LISTED is not a store of zero
+// bytes, and the budget verdict must never print "within budget" for a size nobody measured. An
+// unmeasurable `blobs` path is the reachable form of that (the directory is a file).
+func TestStoreBlobBytesRefusesAnUnmeasurableStore(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "blobs"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if got, err := storeBlobBytes(storekit.OpenStoreDir(dir)); err == nil {
+		t.Fatalf("storeBlobBytes = %d, nil; want an error for a store whose blobs cannot be listed", got)
+	}
+}
+
+// TestStoreSweepRefusesAnUnmeasurableStore is the same property at the sweep's boundary: it must
+// refuse BEFORE evicting (so nothing is deleted on a store whose size and budget could not be
+// reported), and the refusal must say which store and why.
+func TestStoreSweepRefusesAnUnmeasurableStore(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CHARLY_CACHE_DIR", root)
+	seamNoLiveBuild(t)
+	if err := os.MkdirAll(filepath.Join(root, storekit.ImageStoreName), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, storekit.ImageStoreName, "blobs"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	seamQuadlets(t, t.TempDir())
+	seamEngine(t, nil, nil, nil)
+
+	_, err := runStoreSweep("podman", false, 1<<40)
+	if err == nil {
+		t.Fatal("the sweep measured nothing and proceeded; it must refuse")
+	}
+	if !strings.Contains(err.Error(), "cannot be measured") {
+		t.Fatalf("refusal = %q, want it to name the measurement", err)
 	}
 }
 
@@ -530,9 +623,8 @@ func TestClassifierRoutesEachStoreByItsOwnIndex(t *testing.T) {
 		if _, err := s.PutEntry(storekit.Entry{Key: "k", MediaType: "application/vnd.test+json", Payload: dgst}); err != nil {
 			t.Fatalf("PutEntry: %v", err)
 		}
-		reader, reason, err := classifyStore(dir)
-		if err != nil || reader != storeReaderStorekit {
-			t.Fatalf("classifyStore = %v (%q), %v; want storekit", reader, reason, err)
+		if reader, reason := classifyStore(dir); reader != storeReaderStorekit {
+			t.Fatalf("classifyStore = %v (%q); want storekit", reader, reason)
 		}
 	})
 
@@ -542,9 +634,8 @@ func TestClassifierRoutesEachStoreByItsOwnIndex(t *testing.T) {
 		if err := l.Put("k", cache.Entry{Payload: []byte("payload")}); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
-		reader, reason, err := classifyStore(dir)
-		if err != nil || reader != storeReaderSpecCache {
-			t.Fatalf("classifyStore = %v (%q), %v; want spec/cache", reader, reason, err)
+		if reader, reason := classifyStore(dir); reader != storeReaderSpecCache {
+			t.Fatalf("classifyStore = %v (%q); want spec/cache", reader, reason)
 		}
 	})
 
@@ -553,9 +644,8 @@ func TestClassifierRoutesEachStoreByItsOwnIndex(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, storekit.LayoutFile), []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o644); err != nil {
 			t.Fatalf("marker: %v", err)
 		}
-		reader, _, err := classifyStore(dir)
-		if err != nil || reader != storeReaderStorekit {
-			t.Fatalf("classifyStore(empty) = %v, %v; want storekit (a no-op either way, and the stricter walk)", reader, err)
+		if reader, _ := classifyStore(dir); reader != storeReaderStorekit {
+			t.Fatalf("classifyStore(empty) = %v; want storekit (a no-op either way, and the stricter walk)", reader)
 		}
 	})
 
@@ -564,10 +654,7 @@ func TestClassifierRoutesEachStoreByItsOwnIndex(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "index.json"), []byte("{not json"), 0o644); err != nil {
 			t.Fatalf("index: %v", err)
 		}
-		reader, reason, err := classifyStore(dir)
-		if err != nil {
-			t.Fatalf("classifyStore: %v", err)
-		}
+		reader, reason := classifyStore(dir)
 		if reader != storeReaderUnrouted || reason == "" {
 			t.Fatalf("classifyStore = %v (%q); want unrouted with a reason", reader, reason)
 		}

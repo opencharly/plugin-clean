@@ -292,6 +292,14 @@ func normImageRef(ref string) (norm string, hasTag bool) {
 	return s, false
 }
 
+// repoOf is the REPOSITORY half of a normalised reference: `comfyui:2026.1.1` -> `comfyui`. A
+// normalised reference carries no registry host and no digest pin, so the only separator left is the
+// tag's, and a reference that had none normalises to its repository already.
+func repoOf(norm string) string {
+	repo, _, _ := strings.Cut(norm, ":")
+	return repo
+}
+
 // storeEntryDecision is ONE entry's verdict, with the reason a reader can check.
 type storeEntryDecision struct {
 	// Key is the entry's key — for an image entry, the artifact's content address.
@@ -373,16 +381,15 @@ func planStoreEviction(entries []storekit.Entry, res storeRefResolver, inv store
 		if ref == "" {
 			continue
 		}
-		norm, hasTag := normImageRef(ref)
+		norm, _ := normImageRef(ref)
+		// Only an EXACT (tagged) match is resolved through the store, because only a name WITH a
+		// tag denotes one artifact. A bare-repository reference is decided in the classification
+		// loop below, where it keeps EVERY tag of the repository — resolving it here would ask the
+		// store "which build does `vision-gate` mean", and the store would answer for one entry
+		// while the state meant the repository.
 		source, named := inv.refs[norm]
 		if !named {
-			if hasTag {
-				continue
-			}
-			source, named = inv.repos[norm]
-			if !named {
-				continue
-			}
+			continue
 		}
 		if _, done := keepByRef[norm]; done {
 			continue
@@ -418,6 +425,17 @@ func planStoreEviction(entries []storekit.Entry, res storeRefResolver, inv store
 			// the only verdict that cannot be wrong.
 			d.Keep = true
 			d.Reason = fmt.Sprintf("no %s annotation: unclassifiable, so kept", storekit.AnnotationImageName)
+		case inv.repos[repoOf(norm)] != "":
+			// THE BARE-REPOSITORY CASE, and it is checked BEFORE the exact one on purpose: a state
+			// record naming `vision-gate` (a quadlet, a digest-only reference folded to a bare
+			// repository) names the REPOSITORY, not one build of it, so every tag under it is kept.
+			// Evicting a build because the name that kept its sibling carried no tag is a false
+			// evict, and a false evict costs a deployment — the one thing this command must never
+			// do. The price is that a bare reference also protects superseded rebuilds; that is the
+			// conservative direction and it is the direction the inventory's own `repos` doc
+			// promises.
+			d.Keep = true
+			d.Reason = fmt.Sprintf("referenced by %s: the state names the repository %q, so every tag of it is kept", inv.repos[repoOf(norm)], repoOf(norm))
 		case byRef && resolved == e.Key:
 			d.Keep = true
 			d.Reason = fmt.Sprintf("referenced by %s: %s resolves here", inv.sourceOf(norm), d.Ref)
@@ -464,12 +482,15 @@ func shortDigest(dgst string) string {
 	return alg + ":" + hex
 }
 
-// storeBlobBytes measures the store's blobs. A blob that cannot be stat-ed is skipped rather than
-// fatal: this is a SIZE for a report, and the removal path is where a real failure must surface.
-func storeBlobBytes(s *storekit.Store) int64 {
+// storeBlobBytes measures the store's blobs. AN UNMEASURABLE STORE IS AN ERROR, never a zero: a zero
+// would let the budget verdict print "within budget" for a store nobody could size, which is the
+// same lie as "nothing is referenced" one step further on. A blob that cannot be stat-ed after the
+// listing is skipped (it vanished under us), because the LISTING — the thing that decides whether the
+// store can be measured at all — has already succeeded by then.
+func storeBlobBytes(s *storekit.Store) (int64, error) {
 	blobs, err := s.Blobs()
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	var total int64
 	for _, dgst := range blobs {
@@ -481,7 +502,7 @@ func storeBlobBytes(s *storekit.Store) int64 {
 			total += fi.Size()
 		}
 	}
-	return total
+	return total, nil
 }
 
 // sortedKeys returns a set's keys in a deterministic order, so a surface's contribution and its
@@ -538,7 +559,11 @@ func runStoreSweep(engineBin string, dryRun bool, budget int64) (*storeSweepOutc
 	if err != nil {
 		return nil, fmt.Errorf("refusing to evict from the image store %s: %w", dir, err)
 	}
-	out.Held = storeBlobBytes(store)
+	held, herr := storeBlobBytes(store)
+	if herr != nil {
+		return nil, fmt.Errorf("refusing to evict: the image store %s cannot be measured (%v), so neither its size nor its budget could be reported", dir, herr)
+	}
+	out.Held = held
 	for _, d := range out.Decisions {
 		if !d.Keep {
 			out.Evicted++
@@ -571,6 +596,10 @@ func runStoreSweep(engineBin string, dryRun bool, budget int64) (*storeSweepOutc
 		return nil, fmt.Errorf("reclaiming the evicted entries' blobs: %w", berr)
 	}
 	out.Reclaim = bytes
-	out.Retained = storeBlobBytes(store)
+	retained, merr := storeBlobBytes(store)
+	if merr != nil {
+		return nil, fmt.Errorf("the image store %s was swept but cannot be measured afterwards (%v); refusing to print a retained figure that would be a guess", dir, merr)
+	}
+	out.Retained = retained
 	return out, nil
 }
