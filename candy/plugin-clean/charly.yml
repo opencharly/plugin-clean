@@ -243,7 +243,7 @@ plugin-clean:
               id: clean-store-category-present
               context:
                 - build
-              command: "grep -q 'runStoreSweep' store_eviction.go && grep -q 'planStoreEviction' store_eviction.go && grep -q 'refusing to evict' store_eviction.go && grep -q 'classifyStore' store_identity.go && grep -q 'declaredStoreBudget' categories.go && grep -q 'store_budget' schema/clean.cue && grep -q 'effectiveStoreBudget' store_budget.go && grep -q 'budgetFromDeployConfig' store_budget.go && grep -q 'ceiling: %s' command.go"
+              command: "grep -q 'runStoreSweep' store_eviction.go && grep -q 'planStoreEviction' store_eviction.go && grep -q 'refusing to evict' store_eviction.go && grep -q 'classifyStore' store_identity.go && grep -q 'declaredStoreBudget' categories.go && grep -q 'store_budget' schema/clean.cue && grep -q 'effectiveStoreBudget' store_budget.go && grep -q 'budgetFromDeployConfig' store_budget.go && grep -q 'ceiling: %s' command.go && grep -q 'LoadHostCleanSectionViaExecutor' store_budget.go"
             - check: the build-cache category ships its guard, its quarantine discovery and its per-root report
               id: clean-build-cache-category-present
               context:

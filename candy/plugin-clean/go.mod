@@ -2,7 +2,7 @@ module github.com/opencharly/plugin-clean/candy/plugin-clean
 
 go 1.26.8
 
-require github.com/opencharly/sdk v0.2026322.1827
+require github.com/opencharly/sdk v0.2026322.1913
 
 require (
 	cuelabs.dev/go/oci/ociregistry v0.0.0-20251212221603-3adeb8663819 // indirect

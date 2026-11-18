@@ -35,8 +35,8 @@ import (
 	"fmt"
 
 	"github.com/opencharly/sdk"
-	"github.com/opencharly/sdk/deploykit"
 	"github.com/opencharly/sdk/loaderkit"
+	"github.com/opencharly/spec/spec"
 )
 
 // Where an effective ceiling came from, as the report prints it.
@@ -59,34 +59,47 @@ var userStoreBudget = loadUserStoreBudget
 
 // loadUserStoreBudget returns the authored ceiling and whether the machine authored one.
 //
-// An unreadable user configuration is an ERROR, never a silent (0, false): see this file's header.
-func loadUserStoreBudget(ctx context.Context, exec *sdk.Executor, dir string) (int64, bool, error) {
+// ONE call, because sdk#566's reader already implements the discipline this file states: an absent
+// document and an absent `clean:` are both (nil, nil) — the fallback — while an unreadable document, an
+// unresolvable path or a failed bootstrap leg are ERRORS, never a silent "nothing was authored". That
+// distinction is the point: a machine whose configuration cannot be PARSED must not have its builds
+// evicted under a ceiling it never wrote.
+//
+// Why the reader exists at all is worth keeping: `LoadDeployConfigViaExecutor` ends in
+// `deploykit.ProjectDeployConfig(uf)`, which copies only Provides/Deploy/Sidecar and drops every unnamed
+// per-host section; reading `UnifiedFile.Clean` directly returned nil for the same documents. Both looked
+// like an absent ceiling, and the executed positive arm is what exposed them (opencharly/sdk#565).
+//
+// No dir is passed: the reader resolves the STANDARD per-host location itself, which is the only correct
+// one for a machine-scoped setting and the one that honours CHARLY_DEPLOY_CONFIG. Passing the project
+// directory here was a real bug — the reader looked for `clean:` in the project, found nothing, and
+// correctly reported an absent section, which the sweep then read as "no ceiling was authored".
+func loadUserStoreBudget(ctx context.Context, exec *sdk.Executor) (int64, bool, error) {
 	if exec == nil {
 		return 0, false, fmt.Errorf("charly clean --store requires compiled-in placement (the user configuration is read over the reverse channel, which the out-of-process CLI does not have)")
 	}
-	cfg, err := loaderkit.LoadDeployConfigViaExecutor(ctx, exec, dir)
+	clean, err := loaderkit.LoadHostCleanSectionViaExecutor(ctx, exec, "")
 	if err != nil {
 		return 0, false, fmt.Errorf("reading the user configuration: %w", err)
 	}
-	return budgetFromDeployConfig(cfg)
+	return budgetFromCleanSection(clean)
 }
 
 // budgetFromDeployConfig is the DECISION, split out from the read so every level of "unset" can be
 // asserted on the real spec types instead of through a test double: the four levels are
 //
-//	cfg == nil                    -> no user configuration at all        ((0, false, nil))
-//	cfg.Clean == nil              -> a configuration with no clean: block ((0, false, nil))
-//	Clean.StoreBudget == nil      -> a clean: block with no store_budget: ((0, false, nil))
+//	clean == nil                  -> no configuration, or no clean: block ((0, false, nil))
+//	clean.StoreBudget == nil      -> a clean: block with no store_budget: ((0, false, nil))
 //	Bytes > 0                     -> the authored ceiling                ((Bytes, true, nil))
 //
 // and a NON-POSITIVE authored value is an error, because `int64`'s zero cannot tell "authored zero"
 // from "absent" and guessing between them is how a machine's builds get evicted under a ceiling it
 // never wrote.
-func budgetFromDeployConfig(cfg *deploykit.DeployConfig) (int64, bool, error) {
-	if cfg == nil || cfg.Clean == nil || cfg.Clean.StoreBudget == nil {
+func budgetFromCleanSection(clean *spec.CleanSection) (int64, bool, error) {
+	if clean == nil || clean.StoreBudget == nil {
 		return 0, false, nil
 	}
-	if bytes := cfg.Clean.StoreBudget.Bytes; bytes > 0 {
+	if bytes := clean.StoreBudget.Bytes; bytes > 0 {
 		return bytes, true, nil
 	} else {
 		return 0, false, fmt.Errorf("the user configuration authors `clean.store_budget.bytes: %d`, which is not a positive ceiling — refusing to fall back to the plugin default", bytes)

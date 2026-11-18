@@ -22,13 +22,13 @@ import (
 
 // decodeUserConfig decodes ONE per-host document into the type the loader returns, so a test can
 // start from the YAML an operator writes instead of from a Go literal.
-func decodeUserConfig(t *testing.T, doc string) *spec.DeployConfig {
+func decodeUserConfig(t *testing.T, doc string) *spec.UnifiedFile {
 	t.Helper()
-	var cfg spec.DeployConfig
-	if err := yaml.Unmarshal([]byte(doc), &cfg); err != nil {
+	var uf spec.UnifiedFile
+	if err := yaml.Unmarshal([]byte(doc), &uf); err != nil {
 		t.Fatalf("decoding the user configuration: %v", err)
 	}
-	return &cfg
+	return &uf
 }
 
 // TestStoreBudgetFourLevels is #28's matrix, on real documents: three ways of saying nothing all
@@ -63,10 +63,10 @@ func TestStoreBudgetFourLevels(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, has, err := budgetFromDeployConfig(decodeUserConfig(t, c.doc))
+			got, has, err := budgetFromCleanSection(decodeUserConfig(t, c.doc).Clean)
 			if c.wantErr {
 				if err == nil {
-					t.Fatalf("budgetFromDeployConfig = (%d, %v, nil); want a refusal", got, has)
+					t.Fatalf("budgetFromCleanSection = (%d, %v, nil); want a refusal", got, has)
 				}
 				if !strings.Contains(err.Error(), "not a positive ceiling") {
 					t.Fatalf("refusal = %q, want it to name the ceiling", err)
@@ -74,16 +74,16 @@ func TestStoreBudgetFourLevels(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("budgetFromDeployConfig: %v", err)
+				t.Fatalf("budgetFromCleanSection: %v", err)
 			}
 			if got != c.want || has != c.has {
-				t.Fatalf("budgetFromDeployConfig = (%d, %v), want (%d, %v)", got, has, c.want, c.has)
+				t.Fatalf("budgetFromCleanSection = (%d, %v), want (%d, %v)", got, has, c.want, c.has)
 			}
 		})
 	}
 	// The nil CONFIG is its own level (a host with no file), distinct from a file without the block.
-	if _, has, err := budgetFromDeployConfig(nil); err != nil || has {
-		t.Fatalf("budgetFromDeployConfig(nil) = (_, %v, %v); want (_, false, nil)", has, err)
+	if _, has, err := budgetFromCleanSection(nil); err != nil || has {
+		t.Fatalf("budgetFromCleanSection(nil) = (_, %v, %v); want (_, false, nil)", has, err)
 	}
 }
 
@@ -131,9 +131,9 @@ func TestAuthoredCeilingReachesTheSweep(t *testing.T) {
 	seamEngine(t, nil, nil, nil)
 	putImageEntry(t, root, "ghcr.io/opencharly/live:2026.322.0001", "2026-11-18T10:00:00Z", "layer")
 
-	authored, hasAuthored, err := budgetFromDeployConfig(decodeUserConfig(t, "clean:\n  store_budget:\n    bytes: 274877906944\n"))
+	authored, hasAuthored, err := budgetFromCleanSection(decodeUserConfig(t, "clean:\n  store_budget:\n    bytes: 274877906944\n").Clean)
 	if err != nil {
-		t.Fatalf("budgetFromDeployConfig: %v", err)
+		t.Fatalf("budgetFromCleanSection: %v", err)
 	}
 	budget, err := effectiveStoreBudget(authored, hasAuthored)
 	if err != nil {
@@ -175,7 +175,7 @@ func TestReportNamesThePluginDefault(t *testing.T) {
 // so the out-of-process CLI must REFUSE rather than report a ceiling it never read — the live arm of
 // this file's rule, and the same placement constraint the keep-default categories already carry.
 func TestUserStoreBudgetRequiresCompiledInPlacement(t *testing.T) {
-	_, _, err := loadUserStoreBudget(context.Background(), nil, t.TempDir())
+	_, _, err := loadUserStoreBudget(context.Background(), nil)
 	if err == nil {
 		t.Fatal("the out-of-process path resolved a ceiling without a reverse channel")
 	}
@@ -205,7 +205,7 @@ func TestStoreSweepRefusesWithoutAResolvedCeiling(t *testing.T) {
 // `@go(Bytes, type=int64)` and this package holds it in `int64` from the decode to the report.
 func TestStoreBudgetSurvivesTheInt64Projection(t *testing.T) {
 	authored := int64(274877906944) // a VARIABLE: an int32 conversion of a constant is an overflow error
-	got, has, err := budgetFromDeployConfig(decodeUserConfig(t, "clean:\n  store_budget:\n    bytes: 274877906944\n"))
+	got, has, err := budgetFromCleanSection(decodeUserConfig(t, "clean:\n  store_budget:\n    bytes: 274877906944\n").Clean)
 	if err != nil || !has || got != authored {
 		t.Fatalf("budgetFromDeployConfig = (%d, %v, %v), want (%d, true, nil)", got, has, err, authored)
 	}

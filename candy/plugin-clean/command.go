@@ -143,7 +143,7 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 	// an unreadable configuration is a refusal (see store_budget.go), never a silent 32 GiB.
 	var budget storeBudget
 	if plan.store {
-		authored, hasAuthored, berr := userStoreBudget(ctx, exec, dir)
+		authored, hasAuthored, berr := userStoreBudget(ctx, exec)
 		if berr != nil {
 			return berr
 		}
