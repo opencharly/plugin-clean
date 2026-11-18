@@ -205,7 +205,11 @@ func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retention
 		lines = append(lines, storeLines(out.Store)...)
 	}
 	if plan.cache {
-		if len(out.CacheSweep) == 0 {
+		// "no named cache stores found" is a claim about the ROOT, and it is false the moment a store
+		// was found and REFUSED: the refusal line below says a named store WAS found. The two lines
+		// together read as "there are none, and here is the one there is", which is the class of
+		// self-contradicting report this category exists to end.
+		if len(out.CacheSweep) == 0 && len(out.RefusedStores) == 0 {
 			lines = append(lines, "cache: no named cache stores found\n")
 		}
 		for _, s := range out.CacheSweep {

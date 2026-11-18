@@ -853,6 +853,9 @@ func TestCleanCacheRefusesAStoreItCannotClassify(t *testing.T) {
 		t.Fatalf("printRetentionResult: %v", perr)
 	}
 	line := buf.String()
+	if strings.Contains(line, "no named cache stores found") {
+		t.Fatalf("the report says no named stores were found while refusing one:\n%s", line)
+	}
 	if !strings.Contains(line, "cache mixed: REFUSED at "+dir) {
 		t.Fatalf("the report does not name the refused store:\n%s", line)
 	}
