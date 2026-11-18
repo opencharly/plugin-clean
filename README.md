@@ -13,7 +13,7 @@ post-run prune) reach the engine over `verb:retention`.
 
 | Capability | Surface |
 |---|---|
-| `command:clean` | the `charly clean` CLI — `--dry-run`, `--images`, `--check`, `--deep`, `--cache`, `--scopes`, `--keep`, `--invalidate` |
+| `command:clean` | the `charly clean` CLI — `--dry-run`, `--images`, `--check`, `--deep`, `--cache`, `--scopes`, `--build-cache`, `--keep`, `--invalidate` |
 | `verb:retention` | the shared retention engine, invoked by peer plugins |
 
 ## The command
@@ -37,12 +37,28 @@ post-run prune) reach the engine over `verb:retention`.
   reclaimable-bytes figure and touches nothing.
 - **`--invalidate`** — remove stale image TAGS (freeing their exclusively-held
   layers).
+- **`--build-cache`** — reclaim the builder's persistent cache: the buildkitd
+  daemon's state root (`<cache root>/buildkitd`) and every quarantined sibling
+  (`buildkitd.broken-*`). The live root is removed only when no daemon holds its
+  one-instance lock — a running daemon is NAMED and the root left alone — and a
+  quarantined sibling is reclaimed unconditionally, because a store is only
+  quarantined once it has been abandoned. Bytes are reported per root. A tree
+  this user cannot delete whole (a rootless build leaves its store owned by
+  container-mapped UIDs) is reported by name with the blocking path and left
+  exactly as it was, never half-deleted. Strictly opt-in.
+
+The category set itself is declared once, in `candy/plugin-clean/schema/clean.cue`:
+one row per category with its flag, its one-line contract, whether a bare
+`charly clean` runs it, and which categories naming it also runs. The CLI grammar
+and the default set are derived from those rows, so a new category is a row — not
+an edit to a hand-written rule in Go.
 
 While any build is in flight the dangling-image sweeps remove NOTHING and print
 `<label>: SKIPPED — N build(s) in flight` in place of the removed count — a
 declined sweep never looks like an empty store. The scope reaper declines the
 same way (`scopes: SKIPPED — …`), with its own reason when the host has no user
-systemd session to enumerate scopes in.
+systemd session to enumerate scopes in, and `--build-cache` declines
+(`build-cache live: SKIPPED — …`) naming the daemon that holds the store's lock.
 
 ## Image-tag ordering
 
@@ -69,7 +85,8 @@ Compose the plugin candy in a box's `candy:` list:
 ## Layout
 
 - `candy/plugin-clean/` — the plugin module: `plugin.go`, `provider.go`,
-  `command.go`, `retention.go`, `schema/clean.cue`, `cmd/serve/main.go`.
+  `command.go`, `categories.go`, `buildcache.go`, `retention.go`,
+  `schema/clean.cue`, `cmd/serve/main.go`.
 - `charly.yml` — the root project manifest (`discover: candy`).
 - `.github/workflows/tag-on-merge.yml` — CalVer tag + `CHANGELOG/` on merge.
 

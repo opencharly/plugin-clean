@@ -52,7 +52,7 @@ import (
 // reply — a live-build skip signal is dropped here, because the shared wire type cannot carry it;
 // in-process callers that can REPORT a skip use runRetentionOutcome.
 func runRetention(req spec.RetentionRequest) spec.RetentionReply {
-	return runRetentionOutcome(req, false).Reply
+	return runRetentionOutcome(req, cleanPlan{}).Reply
 }
 
 // retentionOutcome is what ONE engine run decided: the WIRE reply PLUS the live-build skip
@@ -96,14 +96,27 @@ type retentionOutcome struct {
 	// ScopeSkip is set when the scope reaper declined on a guard (a live build, or no user systemd
 	// session), never when it merely found nothing.
 	ScopeSkip *retentionSkip
+
+	// BuildCache is the unit list of the `build-cache` category: one entry PER ROOT (the live
+	// state root, then each quarantined sibling), each carrying its own bytes and its own status.
+	// It rides HERE, not on spec.RetentionReply, for the same reason the skip signals and the
+	// scopes do: the builder's persistent cache is a host-hygiene surface that only `charly
+	// clean`'s own CLI reaches — no peer asks for it over verb:retention, and it needs neither the
+	// resolved keep-defaults nor the container engine (see runRetentionOutcome's needsEngine).
+	BuildCache []buildCacheRootOutcome
 }
 
 // runRetentionOutcome runs the requested category(ies) and returns the wire reply plus the
 // live-build skip signal(s) — the form every caller that can REPORT a skip (the plugin's own CLI)
 // uses, so the guard's decision is made once, in the engine, and never re-derived by a caller.
-// scopes is the CLI-only transient build-scope category (see retentionOutcome.Scopes); every
-// peer/wire caller passes false.
-func runRetentionOutcome(req spec.RetentionRequest, scopes bool) retentionOutcome {
+//
+// Two carriers, and the split is deliberate. `req` is the SHARED WIRE request, so it carries the
+// categories a peer plugin can ask for (images/check/deep/cache — see spec.RetentionRequest).
+// `plan` is this invocation's RESOLVED category set (categories.go), and it alone decides the two
+// categories NO wire request can carry: `scopes` and `build-cache` are host-hygiene surfaces that
+// only `charly clean`'s own CLI reaches. Every peer/wire caller passes the zero plan, so neither
+// can ever fire from the wire — the property TestBuildCache_UnreachableFromTheWireRequest pins.
+func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan) retentionOutcome {
 	// The engine is resolved ONLY for the categories that touch the container store. Four of them
 	// never do: the scope reaper (systemd + /proc), the check-run sweep and the .build staging sweep
 	// (filesystem), and the cache GC (the CAS blob store). Resolving it up front made every one of
@@ -210,13 +223,20 @@ func runRetentionOutcome(req spec.RetentionRequest, scopes bool) retentionOutcom
 		}
 		out.RetiredRoots = retired
 	}
-	if scopes {
+	if plan.scopes {
 		reaped, skip, serr := reapBuildScopes(req.DryRun)
 		if serr != nil {
 			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("reaping transient build scopes: %v", serr)}}
 		}
 		out.Scopes = reaped
 		out.ScopeSkip = skip
+	}
+	if plan.buildCache {
+		roots, berr := sweepBuildCache(req.DryRun)
+		if berr != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("sweeping the builder's cache: %v", berr)}}
+		}
+		out.BuildCache = roots
 	}
 	return out
 }

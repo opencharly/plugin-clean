@@ -2,74 +2,195 @@ package clean
 
 import (
 	"bytes"
+	"flag"
 	"strings"
 	"testing"
 
 	"github.com/opencharly/spec/spec"
 )
 
-// TestCleanCategories covers the --images/--check/--deep/--cache/--scopes flag-resolution logic:
-// the pre-existing "any one of --images/--check given alone suppresses the other default
-// categories" behavior stays unchanged, --deep NEVER fires implicitly on a plain `charly clean`
-// (R5: no default-behavior change) but joins the same "an explicit category was given" gate as
-// --images/--check, and --scopes is the one category that runs BOTH by default and with --deep —
-// because it is safe by construction and prevents a whole-host starvation rather than a disk
-// footprint (opencharly/plugin-clean#11: a seven-day orphaned build scope at 12.27/16 load).
+// namedSet builds the map cleanCategories resolves from the six category flags, so a case reads
+// as the flags an operator typed rather than as a positional tuple.
+func namedSet(images, check, deep, cacheGC, scopes, buildCache bool) map[string]bool {
+	out := map[string]bool{}
+	for word, on := range map[string]bool{
+		"images":      images,
+		"check":       check,
+		"deep":        deep,
+		"cache":       cacheGC,
+		"scopes":      scopes,
+		"build-cache": buildCache,
+	} {
+		if on {
+			out[word] = true
+		}
+	}
+	return out
+}
+
+// TestCleanCategories covers the category discipline: the pre-existing "any one of
+// --images/--check given alone suppresses the other default categories" behavior stays unchanged,
+// --deep NEVER fires implicitly on a plain `charly clean` (R5: no default-behavior change) but
+// joins the same "an explicit category was given" gate as --images/--check, --scopes is the one
+// category that runs BOTH by default and with --deep (safe by construction, and a hung build scope
+// starves a whole host rather than costing disk — opencharly/plugin-clean#11), and the new
+// --build-cache is strictly opt-in.
+//
+// ⚑ The discipline is NOT hand-written in Go any more (categories.go derives it from
+// schema/clean.cue's `bare:`/`implies:` rows), so this table is what proves the DERIVATION
+// reproduces the rule the old hand-written `cleanCategories` implemented, case for case. Mutating
+// the declaration — dropping `bare: true` from a default category, or `implies: [scopes]` from
+// `deep` — turns these cases red, which is the point: the schema is the rule, and a silent edit to
+// it cannot pass.
 func TestCleanCategories(t *testing.T) {
 	cases := []struct {
-		name                                        string
-		images, check, deep, cacheGC, scopes        bool
-		wantImages, wantCheck, wantDeep, wantScopes bool
-		wantCache                                   bool
+		name                         string
+		images, check, deep, cacheGC bool
+		scopes, buildCache           bool
+		want                         cleanPlan
 	}{
-		{name: "no flags: full default sweep, scopes included, deep excluded",
-			images: false, check: false, deep: false,
-			wantImages: true, wantCheck: true, wantDeep: false, wantScopes: true},
+		{name: "no flags: full default sweep, scopes included, deep and build-cache excluded",
+			want: cleanPlan{images: true, check: true, scopes: true}},
 		{name: "--images alone: only images, no scopes",
-			images: true, check: false, deep: false,
-			wantImages: true, wantCheck: false, wantDeep: false, wantScopes: false},
+			images: true,
+			want:   cleanPlan{images: true}},
 		{name: "--check alone: only check, no scopes",
-			images: false, check: true, deep: false,
-			wantImages: false, wantCheck: true, wantDeep: false, wantScopes: false},
+			check: true,
+			want:  cleanPlan{check: true}},
 		{name: "--images + --check: both, no scopes",
-			images: true, check: true, deep: false,
-			wantImages: true, wantCheck: true, wantDeep: false, wantScopes: false},
+			images: true, check: true,
+			want: cleanPlan{images: true, check: true}},
 		{name: "--deep alone: deep AND scopes",
-			images: false, check: false, deep: true,
-			wantImages: false, wantCheck: false, wantDeep: true, wantScopes: true},
+			deep: true,
+			want: cleanPlan{deep: true, scopes: true}},
 		{name: "--deep + --images: both, check excluded, scopes from deep",
-			images: true, check: false, deep: true,
-			wantImages: true, wantCheck: false, wantDeep: true, wantScopes: true},
+			images: true, deep: true,
+			want: cleanPlan{images: true, deep: true, scopes: true}},
 		{name: "--deep + --check: both, images excluded, scopes from deep",
-			images: false, check: true, deep: true,
-			wantImages: false, wantCheck: true, wantDeep: true, wantScopes: true},
+			check: true, deep: true,
+			want: cleanPlan{check: true, deep: true, scopes: true}},
 		{name: "all three flags: all four categories",
 			images: true, check: true, deep: true,
-			wantImages: true, wantCheck: true, wantDeep: true, wantScopes: true},
+			want: cleanPlan{images: true, check: true, deep: true, scopes: true}},
 		{name: "--cache alone: only cache (never images/check/scopes)",
-			images: false, check: false, deep: false, cacheGC: true,
-			wantImages: false, wantCheck: false, wantDeep: false, wantCache: true, wantScopes: false},
+			cacheGC: true,
+			want:    cleanPlan{cache: true}},
 		{name: "--cache + --images: both, check and scopes excluded",
-			images: true, check: false, deep: false, cacheGC: true,
-			wantImages: true, wantCheck: false, wantDeep: false, wantCache: true, wantScopes: false},
+			images: true, cacheGC: true,
+			want: cleanPlan{images: true, cache: true}},
 		{name: "--scopes alone: ONLY scopes (no images/check)",
-			images: false, check: false, deep: false, scopes: true,
-			wantImages: false, wantCheck: false, wantDeep: false, wantScopes: true},
+			scopes: true,
+			want:   cleanPlan{scopes: true}},
 		{name: "--scopes + --images: both, check excluded",
-			images: true, check: false, deep: false, scopes: true,
-			wantImages: true, wantCheck: false, wantDeep: false, wantScopes: true},
+			images: true, scopes: true,
+			want: cleanPlan{images: true, scopes: true}},
+		{name: "--build-cache alone: ONLY build-cache — naming it suppresses the default set",
+			buildCache: true,
+			want:       cleanPlan{buildCache: true}},
+		{name: "--build-cache + --scopes: both, and no default category leaks in",
+			scopes: true, buildCache: true,
+			want: cleanPlan{scopes: true, buildCache: true}},
+		{name: "--build-cache + --deep: deep, its scope reap, and the builder's cache",
+			deep: true, buildCache: true,
+			want: cleanPlan{deep: true, scopes: true, buildCache: true}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotImages, gotCheck, gotDeep, gotCache, gotScopes := cleanCategories(c.images, c.check, c.deep, c.cacheGC, c.scopes)
-			if gotImages != c.wantImages || gotCheck != c.wantCheck || gotDeep != c.wantDeep ||
-				gotCache != c.wantCache || gotScopes != c.wantScopes {
-				t.Errorf("cleanCategories(%v,%v,%v,%v,%v) = (%v,%v,%v,%v,%v), want (%v,%v,%v,%v,%v)",
-					c.images, c.check, c.deep, c.cacheGC, c.scopes,
-					gotImages, gotCheck, gotDeep, gotCache, gotScopes,
-					c.wantImages, c.wantCheck, c.wantDeep, c.wantCache, c.wantScopes)
+			got, err := cleanCategories(namedSet(c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache))
+			if err != nil {
+				t.Fatalf("cleanCategories: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("cleanCategories(images=%v,check=%v,deep=%v,cache=%v,scopes=%v,build-cache=%v) = %+v, want %+v",
+					c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, got, c.want)
 			}
 		})
+	}
+}
+
+// TestNewCleanFlagSetAcceptsEveryDeclaredCategory pins the DERIVATION the other way round: every
+// category the schema declares is a flag the CLI accepts, with the row's own contract as its help
+// text, and no category word is registered twice (a duplicate would panic inside flag, so the
+// declaration's uniqueness is asserted where it is decoded AND here).
+func TestNewCleanFlagSetAcceptsEveryDeclaredCategory(t *testing.T) {
+	cats, err := declaredCategories()
+	if err != nil {
+		t.Fatalf("declaredCategories: %v", err)
+	}
+	var f cleanFlags
+	fs, err := newCleanFlagSet(&f)
+	if err != nil {
+		t.Fatalf("newCleanFlagSet: %v", err)
+	}
+	registered := map[string]*flag.Flag{}
+	fs.VisitAll(func(fl *flag.Flag) { registered[fl.Name] = fl })
+	for _, c := range cats {
+		fl, ok := registered[c.Flag]
+		if !ok {
+			t.Errorf("declared category %q is not a flag the CLI accepts", c.Flag)
+			continue
+		}
+		if fl.Usage != c.Contract {
+			t.Errorf("category %q help text = %q, want the declared contract %q", c.Flag, fl.Usage, c.Contract)
+		}
+	}
+	// The reverse direction: the plan's word→field table covers EXACTLY the declared set, so a
+	// field without a row could never be named and a row without a field could never run.
+	if len(categoryPlanFields) != len(cats) {
+		t.Fatalf("categoryPlanFields binds %d word(s) but the schema declares %d", len(categoryPlanFields), len(cats))
+	}
+	for _, c := range cats {
+		if categoryPlanFields[c.Flag] == nil {
+			t.Errorf("declared category %q has no cleanPlan field bound to it", c.Flag)
+		}
+	}
+	var probe cleanPlan
+	for word, field := range categoryPlanFields {
+		declared := false
+		for _, c := range cats {
+			if c.Flag == word {
+				declared = true
+				break
+			}
+		}
+		if !declared {
+			t.Errorf("categoryPlanFields binds %q, which the schema does not declare", word)
+		}
+		if field(&probe) == nil {
+			t.Errorf("categoryPlanFields[%q] returns a nil field", word)
+		}
+	}
+}
+
+// TestCleanCategoriesParseTheFullGrammar drives the real flag parser, so the derived grammar is
+// proven end to end: what `--build-cache` parses to is what cleanCategories resolves, and the
+// modifiers it shares a FlagSet with do not disturb it.
+func TestCleanCategoriesParseTheFullGrammar(t *testing.T) {
+	cases := []struct {
+		args []string
+		want cleanPlan
+	}{
+		{args: nil, want: cleanPlan{images: true, check: true, scopes: true}},
+		{args: []string{"--build-cache"}, want: cleanPlan{buildCache: true}},
+		{args: []string{"--build-cache", "--dry-run"}, want: cleanPlan{buildCache: true}},
+		{args: []string{"--deep", "--dry-run", "--keep", "1"}, want: cleanPlan{deep: true, scopes: true}},
+	}
+	for _, c := range cases {
+		var f cleanFlags
+		fs, err := newCleanFlagSet(&f)
+		if err != nil {
+			t.Fatalf("newCleanFlagSet: %v", err)
+		}
+		if err := fs.Parse(c.args); err != nil {
+			t.Fatalf("parse %v: %v", c.args, err)
+		}
+		got, err := cleanCategories(f.named())
+		if err != nil {
+			t.Fatalf("cleanCategories: %v", err)
+		}
+		if got != c.want {
+			t.Errorf("parse %v resolved %+v, want %+v", c.args, got, c.want)
+		}
 	}
 }
 
@@ -93,7 +214,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			Reply:    spec.RetentionReply{DeepIDs: []string{"sha256:aaaa"}, DeepBytes: 45 << 30},
 			DeepSkip: skipImages,
 		}
-		if err := printRetentionResult(&buf, "removed", false, false, true, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", cleanPlan{deep: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		if got := buf.String(); got != wantDeepSkip {
@@ -112,7 +233,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			DanglingSkip: skipImages,
 			StagingSkip:  skipStaging,
 		}
-		if err := printRetentionResult(&buf, "removed", true, false, false, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", cleanPlan{images: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		want := "images: removed 0 tag(s) (keep_images=3)\n" + wantDanglingSkip + wantStagingSkip +
@@ -131,7 +252,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 			DeepIDs:     []string{"sha256:aaaa", "sha256:cccc"},
 			DeepBytes:   45 << 30,
 		}}
-		if err := printRetentionResult(&buf, "removed", true, false, true, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", cleanPlan{images: true, deep: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := buf.String()
@@ -156,7 +277,7 @@ func TestPrintRetentionResult_SkipIsExplicit(t *testing.T) {
 	t.Run("empty staging is still reported", func(t *testing.T) {
 		var buf bytes.Buffer
 		out := retentionOutcome{Reply: spec.RetentionReply{KeepImages: 3}}
-		if err := printRetentionResult(&buf, "removed", true, false, false, false, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", cleanPlan{images: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		want := "images: removed 0 tag(s) (keep_images=3)\n" +
@@ -180,7 +301,7 @@ func TestPrintRetentionResult_CacheCategory(t *testing.T) {
 			{Name: "project", Entries: 7, RemovedBlobs: 3, RemovedBytes: 2 << 20},
 			{Name: "materialized", Entries: 2, RemovedBlobs: 0, RemovedBytes: 0},
 		}}}
-		if err := printRetentionResult(&buf, "removed", false, false, false, true, false, out); err != nil {
+		if err := printRetentionResult(&buf, "removed", cleanPlan{cache: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		got := buf.String()
@@ -197,7 +318,7 @@ func TestPrintRetentionResult_CacheCategory(t *testing.T) {
 	t.Run("no stores", func(t *testing.T) {
 		var buf bytes.Buffer
 		out := retentionOutcome{Reply: spec.RetentionReply{}}
-		if err := printRetentionResult(&buf, "would remove", false, false, false, true, false, out); err != nil {
+		if err := printRetentionResult(&buf, "would remove", cleanPlan{cache: true}, out); err != nil {
 			t.Fatalf("print: %v", err)
 		}
 		if want := "cache: no named cache stores found\n"; buf.String() != want {
