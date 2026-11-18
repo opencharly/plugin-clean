@@ -44,10 +44,72 @@ type category struct {
 }
 
 var (
+	schemaOnce sync.Once
+	schemaVal  cue.Value
+	schemaErr  error
+
 	categoriesOnce sync.Once
 	categoriesDecl []category
 	categoriesErr  error
 )
+
+// pluginSchema compiles the plugin's OWN served schema exactly once per process. It is the ONE
+// compile every declaration read goes through (the category set today, the store budget beside
+// it): two independent compiles of the same embedded bytes would be two chances to read a
+// different file, and the CLI obeys the schema the host splices only if there is one of them.
+func pluginSchema() (cue.Value, error) {
+	schemaOnce.Do(func() {
+		src, _, err := schemaconcat.ConcatSchema(schemaFS, "schema", nil)
+		if err != nil {
+			schemaErr = fmt.Errorf("clean: reading the plugin schema: %w", err)
+			return
+		}
+		schemaVal = cuecontext.New().CompileString(src)
+		schemaErr = schemaVal.Err()
+		if schemaErr != nil {
+			schemaErr = fmt.Errorf("clean: the plugin schema does not compile: %w", schemaErr)
+			schemaVal = cue.Value{}
+		}
+	})
+	return schemaVal, schemaErr
+}
+
+// storeBudgetOnce caches D-STORE-7's authored size budget (schema/clean.cue
+// `#CleanPlugin.store_budget`).
+var (
+	storeBudgetOnce sync.Once
+	storeBudgetVal  int64
+	storeBudgetErr  error
+)
+
+// declaredStoreBudget returns the store ceiling in BYTES as the plugin's own schema declares it.
+// A hard-coded constant is a defect and so is a silent fallback: a schema that cannot answer is
+// reported, because a budget the sweep invented would bound the store by a number nobody authored.
+func declaredStoreBudget() (int64, error) {
+	storeBudgetOnce.Do(func() {
+		v, err := pluginSchema()
+		if err != nil {
+			storeBudgetErr = err
+			return
+		}
+		b := v.LookupPath(cue.ParsePath("#CleanPlugin.store_budget.bytes"))
+		if derr := b.Err(); derr != nil {
+			storeBudgetErr = fmt.Errorf("clean: the plugin schema declares no #CleanPlugin.store_budget.bytes: %w", derr)
+			return
+		}
+		got, derr := b.Int64()
+		if derr != nil {
+			storeBudgetErr = fmt.Errorf("clean: #CleanPlugin.store_budget.bytes is not an int: %w", derr)
+			return
+		}
+		if got <= 0 {
+			storeBudgetErr = fmt.Errorf("clean: #CleanPlugin.store_budget.bytes is %d; a budget must be positive", got)
+			return
+		}
+		storeBudgetVal = got
+	})
+	return storeBudgetVal, storeBudgetErr
+}
 
 // declaredCategories returns the category set declared in the plugin's own schema, compiled and
 // decoded exactly once per process. A failure here is a DEFECT IN THE EMBEDDED SCHEMA, not a
@@ -61,13 +123,9 @@ func declaredCategories() ([]category, error) {
 }
 
 func loadDeclaredCategories() ([]category, error) {
-	src, _, err := schemaconcat.ConcatSchema(schemaFS, "schema", nil)
+	v, err := pluginSchema()
 	if err != nil {
-		return nil, fmt.Errorf("clean: reading the plugin schema: %w", err)
-	}
-	v := cuecontext.New().CompileString(src)
-	if err := v.Err(); err != nil {
-		return nil, fmt.Errorf("clean: the plugin schema does not compile: %w", err)
+		return nil, err
 	}
 	def := v.LookupPath(cue.ParsePath("#CleanPlugin.categories"))
 	if derr := def.Err(); derr != nil {
@@ -120,12 +178,13 @@ type cleanPlan struct {
 	cache      bool
 	scopes     bool
 	buildCache bool
+	store      bool
 }
 
 // any reports whether the plan runs at least one category — the guard that decides whether the
 // engine is entered at all.
 func (p cleanPlan) any() bool {
-	return p.images || p.check || p.deep || p.cache || p.scopes || p.buildCache
+	return p.images || p.check || p.deep || p.cache || p.scopes || p.buildCache || p.store
 }
 
 // categoryPlanFields binds each DECLARED category flag to the cleanPlan field that carries it. It
@@ -139,6 +198,7 @@ var categoryPlanFields = map[string]func(*cleanPlan) *bool{
 	"cache":       func(p *cleanPlan) *bool { return &p.cache },
 	"scopes":      func(p *cleanPlan) *bool { return &p.scopes },
 	"build-cache": func(p *cleanPlan) *bool { return &p.buildCache },
+	"store":       func(p *cleanPlan) *bool { return &p.store },
 }
 
 // cleanCategories resolves the category flags the operator NAMED into the set this invocation

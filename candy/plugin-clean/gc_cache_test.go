@@ -28,9 +28,12 @@ func TestGCCacheStores(t *testing.T) {
 	}
 
 	// Dry-run: reports the reclaimable set, removes nothing.
-	dry, err := gcCacheStores(true)
+	dry, refused, err := gcCacheStores(true)
 	if err != nil {
 		t.Fatalf("gcCacheStores(dry): %v", err)
+	}
+	if len(refused) != 0 {
+		t.Fatalf("refused = %+v, want none: both stores are spec/cache layouts", refused)
 	}
 	if len(dry) != 2 || dry[0].Name != "materialized" || dry[1].Name != "project" {
 		t.Fatalf("stores = %+v, want [materialized project] sorted", dry)
@@ -44,7 +47,7 @@ func TestGCCacheStores(t *testing.T) {
 	}
 
 	// Real GC: same set, now removed.
-	real, err := gcCacheStores(false)
+	real, _, err := gcCacheStores(false)
 	if err != nil {
 		t.Fatalf("gcCacheStores: %v", err)
 	}
@@ -57,7 +60,7 @@ func TestGCCacheStores(t *testing.T) {
 
 	// A cache root with no stores is an empty list, never an error.
 	t.Setenv("CHARLY_CACHE_DIR", t.TempDir())
-	if got, err := gcCacheStores(false); err != nil || len(got) != 0 {
+	if got, _, err := gcCacheStores(false); err != nil || len(got) != 0 {
 		t.Fatalf("empty root = %+v, %v; want empty, nil", got, err)
 	}
 }

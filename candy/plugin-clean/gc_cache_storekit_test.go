@@ -6,37 +6,48 @@ import (
 	"testing"
 
 	"github.com/opencharly/sdk/storekit"
+	"github.com/opencharly/spec/cache"
 )
 
-// TestGCCacheStoresReachesTheStorekitRoot is the coverage for HALF TWO of
-// gcCacheStores — the CACHE-rooted `storekit` stores that the config-rooted loop
-// cannot see. It is a separate test because the two halves run under DIFFERENT
-// roots, and a single test that pins one root cannot exercise both:
+// storekitMustCacheDir resolves the storekit cache root or fails the test.
+func storekitMustCacheDir(t *testing.T) string {
+	t.Helper()
+	dir, err := storekit.CacheDir()
+	if err != nil {
+		t.Fatalf("storekit.CacheDir: %v", err)
+	}
+	return dir
+}
+
+// TestGCCacheStoresReachesTheStorekitRoot is the coverage for the CACHE-rooted half of
+// gcCacheStores: a storekit store is enumerated, its reader is chosen from its OWN index, and its
+// superseded payload is reclaimed by the store's own reachability walk.
 //
-//	TestGCCacheStores             sets CHARLY_CACHE_DIR -> both resolvers agree ->
-//	                              half two SKIPS, correctly, and half one is covered.
-//	TestGCCacheStoresReaches…     leaves it UNSET and points XDG_CACHE_HOME and
-//	                              XDG_CONFIG_HOME apart -> half two RUNS and is covered.
+// It is a separate test from TestGCCacheStores because the two stores there are `spec/cache`
+// layouts, and a single fixture cannot prove both ROUTES. (Its old form asserted that the cache
+// half SKIPPED whenever the two roots coincided; that skip WAS the defect of
+// opencharly/plugin-clean#27 — the storekit half is now never skipped — and the coincident-root
+// case is covered by TestCleanCacheImageStoreSurvivesTheOneRootOverride.)
 //
-// Neither test alone covers the function, and that is the point: the skip in half two
-// is a real branch with a real reason (the roots coincide when the override is set),
-// so it needs its own fixture rather than a mutation of the other test's.
-//
-// FAILS WITHOUT the change: before it, gcCacheStores returned nothing for a
-// storekit store — the store simply was not enumerated — so the assertions on
+// FAILS WITHOUT the change: before the storekit enumeration existed, gcCacheStores returned
+// nothing for a storekit store — the store was not enumerated at all — so the assertions on
 // RemovedBlobs/RemovedBytes and on the surviving blob all fail.
 func TestGCCacheStoresReachesTheStorekitRoot(t *testing.T) {
 	cacheRoot := t.TempDir()
-	cfgRoot := t.TempDir()
 
-	// The roots must genuinely differ, or this test would silently become a second
-	// copy of TestGCCacheStores. Assert the fixture's premise before relying on it.
 	t.Setenv("CHARLY_CACHE_DIR", "")
 	t.Setenv("XDG_CACHE_HOME", cacheRoot)
-	t.Setenv("XDG_CONFIG_HOME", cfgRoot)
-	if sameStoreRoot() {
-		t.Fatalf("fixture is wrong: the two roots still coincide (%q) — this test cannot "+
-			"exercise half two", cacheRoot)
+	if storekitMustCacheDir(t) == "" {
+		t.Fatal("fixture is wrong: the storekit cache root did not resolve")
+	}
+	// The two enumerators now share ONE resolver (spec/storeroot, D-STORE-1), so the roots always
+	// coincide and `discoverStores` DEDUPES them into one inventory. Assert the premise rather
+	// than assume it: if a future resolver change pulled them apart, this test would still be
+	// valid, but the dedupe it relies on would not be the thing being exercised.
+	if cfgRoot, cerr := cache.StoreRoot(); cerr == nil {
+		if cfgAbs, aerr := filepath.Abs(cfgRoot); aerr == nil && cfgAbs == filepath.Clean(storekitMustCacheDir(t)) {
+			t.Logf("the two store roots coincide at %s (the D-STORE-1 one-resolver case); discoverStores dedupes them", cfgAbs)
+		}
 	}
 
 	// A storekit store with a superseded payload: the documented leak. PutEntry
@@ -49,13 +60,10 @@ func TestGCCacheStoresReachesTheStorekitRoot(t *testing.T) {
 	if err := os.MkdirAll(s.Dir(), 0o755); err != nil {
 		t.Fatalf("mkdir store: %v", err)
 	}
-	// The layout marker, written by the fixture because `storekit` itself never writes
-	// it: PutBlob/PutEntry create `blobs/` and `index.json` and stop there, while
-	// NamedStores() enumerates on `oci-layout` alone (measured — a store created
-	// through the API's own writers is invisible to its own enumeration until the
-	// marker exists). spec/cache's sibling writes it in its Layout constructor, so
-	// this is a gap in storekit rather than a convention the caller should know.
-	// Filed as its own finding; the test needs the marker to be a store at all.
+	// The layout marker. `storekit` writes it from `indexEntry` (its ONE index writer, which
+	// calls EnsureLayout) as of opencharly/sdk#556; the fixture still writes it explicitly so the
+	// test does not depend on which writer created the store, and so the marker's presence is a
+	// property this test asserts rather than one it inherits.
 	if err := os.WriteFile(filepath.Join(s.Dir(), storekit.LayoutFile), []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o644); err != nil {
 		t.Fatalf("write %s marker: %v", storekit.LayoutFile, err)
 	}
@@ -76,7 +84,7 @@ func TestGCCacheStoresReachesTheStorekitRoot(t *testing.T) {
 
 	// Dry run: the store is reached, the unreferenced payload is reported, and the
 	// number the dry run reports is the number the real run must later remove.
-	dry, err := gcCacheStores(true)
+	dry, _, err := gcCacheStores(true)
 	if err != nil {
 		t.Fatalf("gcCacheStores(dry): %v", err)
 	}
@@ -106,7 +114,7 @@ func TestGCCacheStoresReachesTheStorekitRoot(t *testing.T) {
 
 	// Real run: the same set, now removed — and the LIVE payload survives, which is
 	// the assertion that would catch a sweep that subtracted the wrong set.
-	real, err := gcCacheStores(false)
+	real, _, err := gcCacheStores(false)
 	if err != nil {
 		t.Fatalf("gcCacheStores: %v", err)
 	}

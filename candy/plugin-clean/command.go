@@ -201,6 +201,9 @@ func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retention
 			fmt.Sprintf("%s %d hung transient build scope(s) (active > %s, no live builder)",
 				tag, len(out.Scopes), buildScopeMaxAge), out.Scopes)...)
 	}
+	if plan.store && out.Store != nil {
+		lines = append(lines, storeLines(out.Store)...)
+	}
 	if plan.cache {
 		if len(reply.CacheStores) == 0 {
 			lines = append(lines, "cache: no named cache stores found\n")
@@ -212,6 +215,9 @@ func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retention
 		// The retired roots, reported even when there is nothing to remove: "already gone" and
 		// "never existed" are the states a re-run reaches, and a silent omission would read as a
 		// sweep that found nothing to do rather than one with nothing to do.
+		for _, r := range out.RefusedStores {
+			lines = append(lines, fmt.Sprintf("cache %s: REFUSED at %s — %s\n", r.Name, r.Dir, r.Reason))
+		}
 		for _, r := range out.RetiredRoots {
 			switch {
 			case !r.Present:
@@ -228,6 +234,92 @@ func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retention
 		return fmt.Errorf("printing the clean report: %w", err)
 	}
 	return nil
+}
+
+// storeLines renders the `store` category (D-STORE-7): the surfaces it read, the decision it made
+// entry by entry, and the measured result against the authored budget.
+//
+// EVERY surface line prints, including one that legitimately found nothing: "the quadlets named
+// nothing" and "the quadlets were not read" are the two states an operator must be able to tell
+// apart, because the second is the one that deletes a live image. The sweep refuses rather than
+// printing the second as if it were the first — the SKIP line covers the live-build case, and a
+// refusal is an error, not a line.
+//
+// The BUDGET line is measured against a store size that is really measured in both modes: the
+// sweep's `Held` before it (a dry run) and its `Retained` after it (a real run). A dry run cannot
+// size the post-sweep store — the store's public surface cannot evaluate a hypothetical entry set
+// without deleting it — so it says which number it is rather than printing one that would read as
+// the other.
+func storeLines(o *storeSweepOutcome) []string {
+	if o.Skip != nil {
+		return []string{"store: " + o.Skip.String() + "\n"}
+	}
+	var lines []string
+	for _, s := range o.Surfaces {
+		if s.Absent {
+			lines = append(lines, fmt.Sprintf("store state %s: absent at %s (nothing to reference)\n", s.Name, s.Where))
+			continue
+		}
+		carried := fmt.Sprintf("%d ref(s)", s.Refs)
+		if s.Digests > 0 {
+			carried += fmt.Sprintf(", %d content address(es)", s.Digests)
+		}
+		lines = append(lines, fmt.Sprintf("store state %s: %s (%s)\n", s.Name, carried, s.Where))
+	}
+	if len(o.Decisions) == 0 {
+		lines = append(lines, fmt.Sprintf("store %s: no entries\n", o.Dir))
+		return lines
+	}
+	kept, evicted := o.kept(), o.evicted()
+	verb := "evicted"
+	if o.DryRun {
+		verb = "would evict"
+	}
+	lines = append(lines, fmt.Sprintf("store %s: %d entry(ies); %d kept by state, %d %s\n",
+		o.Dir, len(o.Decisions), len(kept), len(evicted), verb))
+	for _, d := range kept {
+		lines = append(lines, fmt.Sprintf("  kept    %s  %s  (%s)\n", refLabel(d.Ref), shortDigest(d.Key), d.Reason))
+	}
+	for _, d := range evicted {
+		lines = append(lines, fmt.Sprintf("  evict   %s  %s  (%s)\n", refLabel(d.Ref), shortDigest(d.Key), d.Reason))
+	}
+	if o.AlreadyGone > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"  (%d planned eviction(s) found the entry already gone — a concurrent writer got there first)\n",
+			o.AlreadyGone))
+	}
+	if o.DryRun {
+		lines = append(lines, fmt.Sprintf(
+			"store budget: %s held of %s — the real run measures what the evicted entries leave behind\n",
+			kit.HumanBytes(o.Held), kit.HumanBytes(o.Budget)))
+		lines = append(lines, fmt.Sprintf(
+			"store reclaim: would free %s of already-unreferenced blob(s), and each evicted entry's own layers with them\n",
+			kit.HumanBytes(o.Reclaim)))
+		return lines
+	}
+	lines = append(lines, fmt.Sprintf("store budget: retained %s of %s (%s)\n",
+		kit.HumanBytes(o.Retained), kit.HumanBytes(o.Budget), budgetVerdict(o.Retained, o.Budget)))
+	lines = append(lines, fmt.Sprintf("store reclaim: freed %s of blobs no surviving entry reaches\n", kit.HumanBytes(o.Reclaim)))
+	return lines
+}
+
+// budgetVerdict is whether the store the sweep left behind is inside D-STORE-7's budget. An
+// over-budget store is REPORTED, never "fixed": the entries that are left are the ones state
+// references, and evicting one of them to meet a number is the failure this command exists to
+// avoid.
+func budgetVerdict(retained, budget int64) string {
+	if retained <= budget {
+		return "within budget"
+	}
+	return fmt.Sprintf("OVER budget by %s — the state references these entries, so nothing further may be evicted", kit.HumanBytes(retained-budget))
+}
+
+// refLabel renders an entry's reference, or a dash for an entry that carries none.
+func refLabel(ref string) string {
+	if ref == "" {
+		return "-"
+	}
+	return ref
 }
 
 // buildCacheLines renders the `--build-cache` section: ONE line per root, each carrying its own

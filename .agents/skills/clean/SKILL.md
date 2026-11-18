@@ -13,7 +13,7 @@ description: |-
 the on-demand counterpart to the auto-pruning that runs after `charly box build`
 and `charly check run`.
 
-`charly clean` is a **compiled-in COMMAND-class plugin** (`candy/plugin-clean`, `command:clean`) that OWNS the command AND (K1-alpha core-minimization) the **shared retention ENGINE** itself — `pruneImagesByRetention`, `pruneCheckRuns`, `pruneBuildCandyDirs`, `invalidateImageTags`, `pruneDeepDanglingImages`, and the charly-labeled image-tag CalVer/label inventory (`candy/plugin-clean/retention.go`), relocated from the former `charly/retention.go` since it has zero core-only dependencies (`kit.CalVer`/`kit.ListLocalImages`/`kit.BuildActivityDir` are all sdk-portable). The plugin owns the flag grammar (`--dry-run` / `--images` / `--check` / `--deep` / `--cache` / `--scopes` / `--build-cache` / `--keep` / `--invalidate`) — DERIVED from the declared category set in `schema/clean.cue` — the category orchestration, and the report output. `charly clean`'s own CLI calls the engine LOCALLY (no wire hop, same package). The other three callers — `charly box build`'s post-build prune, `charly box list tags`, and `charly check run`'s post-run prune (candy/plugin-check) — reach it via a new `verb:retention` capability (a `spec.RetentionRequest` → `spec.RetentionReply` Invoke), the SAME peer/core-adapter pattern verb:credential/verb:gpu/verb:tunnel already use: core's two callers (already running `LoadConfig` in-process) resolve `defaults.keep_images`/`keep_check_runs` themselves and pass the resolved ints in the request; plugin-check (a peer plugin, not core) reaches verb:retention via `InvokeProvider`. The SAME defaults, for its OWN CLI, resolve PLUGIN-SIDE via the shared `sdk/loaderkit.ResolveRetentionDefaultsViaExecutor` (K-wave 2 cone R6 — the former **"retention-defaults" `HostBuild` seam** `charly/host_build_retention_defaults.go` is DELETED: the loader is plugin-reachable over the reverse channel, so every `verb:retention` caller resolves the tunables itself). clean is **compiled-in** (`charly/charly.yml` `compiled_plugins:`) because its `Invoke(OpRun)` needs the in-proc reverse channel — threaded by `dispatchInProcCommand` ("Seam A") — to reach the host loader legs for that resolve; the out-of-process `CliMain` path has no reverse channel, so the categories needing a resolved keep-default (images/check/deep) error there — list/invalidate need no default and run standalone, and `--cache`, `--scopes` and `--build-cache` need neither the defaults nor the container engine, so they run there too (and on a host whose podman is broken). This is the same "plugin owns the logic + generic seams for the core-coupled bits" doctrine the vm + pod deploy plugins established — no hidden core-command forward, and no plugin-specific command logic left in core.
+`charly clean` is a **compiled-in COMMAND-class plugin** (`candy/plugin-clean`, `command:clean`) that OWNS the command AND (K1-alpha core-minimization) the **shared retention ENGINE** itself — `pruneImagesByRetention`, `pruneCheckRuns`, `pruneBuildCandyDirs`, `invalidateImageTags`, `pruneDeepDanglingImages`, and the charly-labeled image-tag CalVer/label inventory (`candy/plugin-clean/retention.go`), relocated from the former `charly/retention.go` since it has zero core-only dependencies (`kit.CalVer`/`kit.ListLocalImages`/`kit.BuildActivityDir` are all sdk-portable). The plugin owns the flag grammar (`--dry-run` / `--images` / `--check` / `--deep` / `--cache` / `--scopes` / `--build-cache` / `--store` / `--keep` / `--invalidate`) — DERIVED from the declared category set in `schema/clean.cue` — the category orchestration, and the report output. `charly clean`'s own CLI calls the engine LOCALLY (no wire hop, same package). The other three callers — `charly box build`'s post-build prune, `charly box list tags`, and `charly check run`'s post-run prune (candy/plugin-check) — reach it via a new `verb:retention` capability (a `spec.RetentionRequest` → `spec.RetentionReply` Invoke), the SAME peer/core-adapter pattern verb:credential/verb:gpu/verb:tunnel already use: core's two callers (already running `LoadConfig` in-process) resolve `defaults.keep_images`/`keep_check_runs` themselves and pass the resolved ints in the request; plugin-check (a peer plugin, not core) reaches verb:retention via `InvokeProvider`. The SAME defaults, for its OWN CLI, resolve PLUGIN-SIDE via the shared `sdk/loaderkit.ResolveRetentionDefaultsViaExecutor` (K-wave 2 cone R6 — the former **"retention-defaults" `HostBuild` seam** `charly/host_build_retention_defaults.go` is DELETED: the loader is plugin-reachable over the reverse channel, so every `verb:retention` caller resolves the tunables itself). clean is **compiled-in** (`charly/charly.yml` `compiled_plugins:`) because its `Invoke(OpRun)` needs the in-proc reverse channel — threaded by `dispatchInProcCommand` ("Seam A") — to reach the host loader legs for that resolve; the out-of-process `CliMain` path has no reverse channel, so the categories needing a resolved keep-default (images/check/deep) error there — list/invalidate need no default and run standalone; `--cache`, `--scopes` and `--build-cache` need neither the defaults nor the container engine, so they run there too (and on a host whose podman is broken); `--store` needs the container engine (it is one of its state surfaces) but no loader default, so it runs out-of-process on a host whose engine answers, and REFUSES there when it does not. This is the same "plugin owns the logic + generic seams for the core-coupled bits" doctrine the vm + pod deploy plugins established — no hidden core-command forward, and no plugin-specific command logic left in core.
 
 Two artifact classes, two policies (operator principle):
 
@@ -58,13 +58,21 @@ charly clean --build-cache        # reclaim the builder's persistent cache — t
                                   # quarantined sibling (buildkitd.broken-*); bytes per root
 charly clean --build-cache --dry-run  # the same report; removes nothing, and does not even
                                       # create the daemon's lock file to ask who owns the root
+charly clean --store      # D-STORE-7: evict the charly image store entries the HOST's charly
+                          # state no longer references (engine containers + quadlet units), free
+                          # the blobs no surviving entry reaches, and report the retained size
+                          # against the AUTHORED budget; REFUSES when a state surface cannot be read
+charly clean --store --dry-run   # the same decision, entry by entry, with the reason for each;
+                                 # touches nothing
 ```
 
-With **none** of `--images` / `--check` / `--deep` / `--cache` / `--scopes` / `--build-cache`, the
-**four** DEFAULT categories run (image-tag + check-run + build-candy + scopes); naming ANY category
-flag suppresses that default set and runs only what was named (plus, for `--deep`, the scope reap
-below). `--scopes` IS in the default set because it is itself a category flag, and `--deep` and
-`--cache` and `--build-cache` NEVER fire implicitly.
+With **none** of `--images` / `--check` / `--deep` / `--cache` / `--scopes` / `--build-cache` /
+`--store`, the **four** DEFAULT categories run (image-tag + check-run + build-candy + scopes);
+naming ANY category flag suppresses that default set and runs only what was named (plus, for
+`--deep`, the scope reap below). `--scopes` IS in the default set because it is itself a category
+flag, and `--deep` and `--cache` and `--build-cache` and `--store` NEVER fire implicitly — for
+`--store` that is a safety property, not a preference: it is the only category that deletes
+ARTIFACTS.
 **The discipline is DECLARED, not coded.** The category set lives in
 `candy/plugin-clean/schema/clean.cue` (`#CleanPlugin.categories`: one row per category, with its flag
 word, its one-line contract — which is also the flag's help text — `bare:` = runs on an unqualified
@@ -77,7 +85,8 @@ because `scopes` declares `bare: true` — a new category is a row, not an edit 
 `--keep N` overrides both the image and check-run retention counts for the invocation (it does
 not affect `--deep`, which has no keep-N — it purges every untagged image).
 **Category names, from the engine's own header** (`retention.go`): *image-tag / build-candy / check-run
-pruning*, plus the `--deep` store-wide purge and the `--cache` blob sweep. The middle one prunes
+pruning*, plus the `--deep` store-wide purge, the `--cache` blob sweep and the `--store` entry
+eviction. The middle one prunes
 `.build/_candy/<candy>.<version>/` per candy (`pruneBuildCandyDirs`).
 
 **`--deep` — the store-wide untagged/dangling-image purge.** The default image-tag sweep above
@@ -143,6 +152,80 @@ an empty read-only directory is not a blocker either (rmdir needs write on the P
 directory itself). Both paths come from `sdk/buildkitdrive`; nothing here builds a `<cache>/buildkitd`
 path by hand, and the sweep needs neither the container engine nor the resolved keep-defaults — so it
 works on a host whose podman is missing or broken.
+
+## The `--store` category — `D-STORE-7`, the image store's ENTRY policy
+
+`DESIGN.md:2488` (`D-STORE-7`): *"`charly clean` keeps what state references and evicts the rest
+within a size budget; locks die with their holder."* `--store` implements that row for the charly
+image store — the `registry` NAMED store under the cache root, whose entries are the artifacts every
+build APPENDS (a rebuild produces a different digest, so it is a different key beside the old one,
+never a replacement). Nothing else ever removed an entry, so a store measured at 283 GiB / 172
+entries on the host this was written on grew by one artifact per rebuild forever.
+
+**It is a REFERENCE rule, never a recency one.** `keep_images`' "newest N" would delete a running
+deployment's image if it happened to be the fourth; `--store` asks what charly's own state still
+names, from two surfaces read through shared resolvers:
+
+| Surface | What it is | Why it is in the inventory |
+|---|---|---|
+| the container engine (`podman ps -a`) | every container, running or stopped: its image ref and its image ID | the runtime truth a deploy actually runs — the surface `charly status --json` publishes as `image_ref` |
+| the quadlet units (`$HOME/.config/containers/systemd/charly-*.container`, `Image=`) | the unit charly wrote for each pod deploy | the ONLY record of an ENABLED deploy whose container does not exist yet (`status --all`'s `enabled` rows carry no `image_ref`) |
+
+Each state reference is resolved to an entry through **`ImageStore.Lookup`** — the store's own
+"the newest entry whose annotation names this reference" — because state names a REFERENCE while
+the store keys on the artifact's DIGEST. That resolution is also what makes a *superseded rebuild of
+a referenced tag* reclaimable: when the engine still runs `vision-gate` and the store holds five
+entries under that annotation, the name resolves to the newest and the four older ones are evicted
+with the reason `superseded: … the store resolves it to <digest>`. An entry whose own content
+address (digest) a container or a pin names is kept outright. An entry carrying no
+`io.containerd.image.name` annotation is kept as `unclassifiable`, because the only verdict that
+cannot be wrong is to leave it.
+
+**It refuses rather than assume.** An unreadable state surface is NOT an empty one: "nothing is
+referenced" is how a sweep deletes the image a running deployment was built from. So a failed
+`podman ps`, a quadlet that cannot be read, a charly quadlet with no `Image=` line, an index that
+disagrees with its own entries, or a store that cannot be enumerated **aborts the whole sweep** with
+an error naming the surface and the path, and evicts nothing. `--dry-run` refuses on exactly the
+same inputs — a dry run that predicted an eviction the real run then refused would be a lie about
+the plan.
+
+**The budget is AUTHORED, and it never authorises evicting live state.** `schema/clean.cue`
+`#CleanPlugin.store_budget.bytes` (SDD: CUE first, Go derived — a hard-coded constant is a defect).
+The sweep reports the store's RETAINED bytes against it and says `within budget` or `OVER budget by
+<bytes>`; being over budget is REPORTED, never "fixed", because the entries left are the ones state
+references. The budget is not project-tunable yet — opencharly/plugin-clean#28 carries that half.
+
+**What a dry run can and cannot say.** The DECISION is identical in both modes (same entries, same
+reasons, tested by mutation). The BYTE figure is not: a dry run measures the store as it is (`N
+held of <budget>`) plus the blobs already unreferenced, while the retained size after eviction needs
+the eviction — the store's public surface cannot size a hypothetical entry set without deleting it,
+and a number that looked like the post-sweep size while being the pre-sweep one is exactly the kind
+of figure this report exists to avoid.
+
+A live build makes it **decline**: an artifact's blobs are published BEFORE its entry, so a sweep
+between the two would free bytes an in-flight entry has not indexed yet.
+
+**Out of scope, stated rather than guessed:** DECLARED configuration is not state. A `kind: vm`
+whose disk was built from a container image is the one place a store artifact is needed without any
+host record naming it (opencharly/plugin-vm#98 carries that gap).
+
+## The `--cache` category's routing — one reader per store, chosen by IDENTITY
+
+`--cache` sweeps every named store's unreferenced blobs. It used to run in two halves — `spec/cache`
+layouts by name, and `storekit` stores by name — and to SKIP the storekit half whenever the two
+roots resolved to the same directory. `CHARLY_CACHE_DIR` is exactly that case (it is the one
+override `D-STORE-1` blesses, and how a bed isolates its cache), so on those hosts the
+storekit-written `registry` store was handed to `spec/cache`'s IMAGE-BLIND `GCStats`: it deleted a
+live image's manifest, config and layers and left the entry answering `Lookup(ref)` for bytes that
+were gone (opencharly/plugin-clean#27). The mirror mistake was available too — storekit's reader
+would have decoded `spec/cache` manifests as empty entries and freed their payloads.
+
+The reader is now chosen from the STORE'S OWN INDEX (`classifyStore`): every descriptor an
+`application/vnd.opencharly.store.entry.v1+json` entry manifest → storekit; every descriptor an OCI
+image manifest → `spec/cache`. The two enumerations are deduped into ONE inventory by resolved
+directory, so no store is skipped and none is swept twice; a store whose index mixes media types, or
+cannot be read, is REFUSED and reported by name. Because the image store is never opened by
+`spec/cache` any more, no `.lock` is written inside its tree either (`D-STORE-3`, `DESIGN.md:2484`).
 
 ## What gets pruned (and what never does)
 
@@ -252,6 +335,12 @@ chain in Go), `command.go` (the flag grammar registered FROM the declaration, `c
 and the per-root report),
 `buildcache.go` (the `--build-cache` category: the live root's flock guard, the quarantined-sibling
 discovery, and the measure-then-refuse-or-remove walk),
+`store_eviction.go` (the `--store` category: `readStoreStateInventory` — the engine + quadlet
+surfaces and their refusals, `planStoreEviction` — the pure per-entry verdict, `runStoreSweep` — the
+live-build decline, the eviction, the reclaim and the budget verdict, plus `storeBlobBytes`),
+`store_identity.go` (`classifyStore` — the reader chosen from the store's own index,
+`discoverStores` — the deduped inventory, `sweepStoreBlobs` — the ONE per-store reclaim both
+`--cache` and `--store` call),
 `provider.go` (`Invoke`, dispatching by word — `"clean"` for the CLI, `"retention"` for the
 engine — the compiled-in dispatch surface for both), `plugin.go` (`NewProvider` / `NewMeta`
 advertising `command:clean` + `verb:retention` / `CliMain`), `retention.go` (the relocated
