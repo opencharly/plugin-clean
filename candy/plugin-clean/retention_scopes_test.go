@@ -287,7 +287,7 @@ func TestReapBuildScopes_DecisionIsUnreachableFromTheWireRequest(t *testing.T) {
 		return []buildScope{{Unit: "runc-buildah-buildahHUNG.scope", AgeSeconds: 7 * 24 * 3600}}, nil
 	}
 
-	out := runRetentionOutcome(spec.RetentionRequest{Cache: true}, cleanPlan{})
+	out := runRetentionOutcome(spec.RetentionRequest{Cache: true}, cleanPlan{}, storeBudget{})
 	if len(out.Scopes) != 0 || len(stopped) != 0 {
 		t.Fatalf("the wire form stopped a scope: scopes=%v stopped=%v", out.Scopes, stopped)
 	}
@@ -322,7 +322,7 @@ func TestScopesOnlyRunNeedsNoEngine(t *testing.T) {
 	}
 
 	// The scopes-only run must reap WITHOUT ever resolving an engine.
-	out := runRetentionOutcome(spec.RetentionRequest{DryRun: true}, cleanPlan{scopes: true})
+	out := runRetentionOutcome(spec.RetentionRequest{DryRun: true}, cleanPlan{scopes: true}, storeBudget{})
 	if out.Reply.Error != "" {
 		t.Fatalf("a scopes-only run failed on engine resolution: %s", out.Reply.Error)
 	}
@@ -335,7 +335,7 @@ func TestScopesOnlyRunNeedsNoEngine(t *testing.T) {
 
 	// The negative control: an images-only run DOES need it, and a host without it must fail loudly
 	// rather than silently prune nothing.
-	img := runRetentionOutcome(spec.RetentionRequest{Images: true, DryRun: true}, cleanPlan{})
+	img := runRetentionOutcome(spec.RetentionRequest{Images: true, DryRun: true}, cleanPlan{}, storeBudget{})
 	if img.Reply.Error == "" || resolved != 1 {
 		t.Fatalf("an images-only run must resolve the engine and fail on its absence: err=%q resolved=%d",
 			img.Reply.Error, resolved)

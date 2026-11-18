@@ -52,7 +52,10 @@ import (
 // reply — a live-build skip signal is dropped here, because the shared wire type cannot carry it;
 // in-process callers that can REPORT a skip use runRetentionOutcome.
 func runRetention(req spec.RetentionRequest) spec.RetentionReply {
-	return runRetentionOutcome(req, cleanPlan{}).Reply
+	// The wire request has no budget field and no caller of this path runs the `store` category
+	// (only `charly clean`'s own CLI does), so the zero value is the honest argument: a peer's
+	// post-build or post-run prune must never evict a store entry.
+	return runRetentionOutcome(req, cleanPlan{}, storeBudget{}).Reply
 }
 
 // retentionOutcome is what ONE engine run decided: the WIRE reply PLUS the live-build skip
@@ -134,7 +137,7 @@ type retentionOutcome struct {
 // categories NO wire request can carry: `scopes` and `build-cache` are host-hygiene surfaces that
 // only `charly clean`'s own CLI reaches. Every peer/wire caller passes the zero plan, so neither
 // can ever fire from the wire — the property TestBuildCache_UnreachableFromTheWireRequest pins.
-func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan) retentionOutcome {
+func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan, budget storeBudget) retentionOutcome {
 	// The engine is resolved ONLY for the categories that touch the container store. Four of them
 	// never do: the scope reaper (systemd + /proc), the check-run sweep and the .build staging sweep
 	// (filesystem), and the cache GC (the CAS blob store). Resolving it up front made every one of
@@ -229,9 +232,10 @@ func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan) retentionOut
 		out.DeepSkip = skip
 	}
 	if plan.store {
-		budget, berr := declaredStoreBudget()
-		if berr != nil {
-			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("the image store's size budget: %v", berr)}}
+		if budget.Bytes <= 0 {
+			// Only `charly clean`'s CLI resolves a ceiling (`command.go`), so reaching here without
+			// one is a wiring defect, not a host condition: refuse rather than sweep against zero.
+			return retentionOutcome{Reply: spec.RetentionReply{Error: "the store category reached the engine without a resolved ceiling"}}
 		}
 		// BEFORE the cache sweep, deliberately: the entry eviction reclaims its own store's blobs
 		// through the shared reclaim, and a `--store --cache` run must not report the registry

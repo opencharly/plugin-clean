@@ -178,7 +178,7 @@ func TestStoreSweepEvictsOnlyWhatStateNoLongerReferences(t *testing.T) {
 	seamQuadlets(t, units)
 	seamEngine(t, nil, nil, nil)
 
-	out, err := runStoreSweep("podman", false, 1<<40)
+	out, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("runStoreSweep: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestStoreSweepKeepsAReferencedEntryEvenOverBudget(t *testing.T) {
 
 	// A budget of ONE byte: unreachable for any real store, and the one case where a sweep that
 	// "honoured the budget" by evicting the referenced entry would look successful.
-	out, err := runStoreSweep("podman", false, 1)
+	out, err := runStoreSweep("podman", false, storeBudget{Bytes: 1, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("runStoreSweep: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestStoreSweepWithinBudget(t *testing.T) {
 	seamQuadlets(t, units)
 	seamEngine(t, nil, nil, nil)
 
-	out, err := runStoreSweep("podman", false, 1<<40)
+	out, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("runStoreSweep: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestStoreSweepKeepsAnEntryReferencedByContentAddress(t *testing.T) {
 	seamQuadlets(t, t.TempDir())
 	seamEngine(t, nil, []string{key}, nil) // the engine's ImageID is the artifact's content address
 
-	out, err := runStoreSweep("podman", false, 1<<40)
+	out, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("runStoreSweep: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestStoreSweepEvictsASupersededRebuildOfAReferencedRef(t *testing.T) {
 	seamQuadlets(t, units)
 	seamEngine(t, nil, nil, nil)
 
-	out, err := runStoreSweep("podman", false, 1<<40)
+	out, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("runStoreSweep: %v", err)
 	}
@@ -376,7 +376,7 @@ func TestStoreSweepKeepsEveryTagOfABareRepositoryReference(t *testing.T) {
 	seamQuadlets(t, units)
 	seamEngine(t, nil, nil, nil)
 
-	out, err := runStoreSweep("podman", false, 1<<40)
+	out, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("runStoreSweep: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestStoreSweepRefusesAnUnmeasurableStore(t *testing.T) {
 	seamQuadlets(t, t.TempDir())
 	seamEngine(t, nil, nil, nil)
 
-	_, err := runStoreSweep("podman", false, 1<<40)
+	_, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err == nil {
 		t.Fatal("the sweep measured nothing and proceeded; it must refuse")
 	}
@@ -453,7 +453,7 @@ func TestStoreSweepDryRunMakesTheSameDecisionAndTouchesNothing(t *testing.T) {
 	seamQuadlets(t, units)
 	seamEngine(t, nil, nil, nil)
 
-	dry, err := runStoreSweep("podman", true, 1<<40)
+	dry, err := runStoreSweep("podman", true, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("dry runStoreSweep: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestStoreSweepDryRunMakesTheSameDecisionAndTouchesNothing(t *testing.T) {
 	if !blobPresent(t, root, deadKey) {
 		t.Fatal("the dry run evicted an entry")
 	}
-	real, err := runStoreSweep("podman", false, 1<<40)
+	real, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("real runStoreSweep: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestStoreSweepRefusesWhenTheEngineCannotBeListed(t *testing.T) {
 	seamQuadlets(t, t.TempDir())
 	seamEngine(t, nil, nil, errors.New("cannot connect to Podman socket"))
 
-	_, err := runStoreSweep("podman", false, 1<<40)
+	_, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err == nil {
 		t.Fatal("the sweep ran against an unreadable engine — it must refuse")
 	}
@@ -524,7 +524,7 @@ func TestStoreSweepRefusesAQuadletItCannotInterpret(t *testing.T) {
 	seamQuadlets(t, units)
 	seamEngine(t, nil, nil, nil)
 
-	_, err := runStoreSweep("podman", false, 1<<40)
+	_, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err == nil {
 		t.Fatal("the sweep ran past a quadlet it could not interpret")
 	}
@@ -548,7 +548,7 @@ func TestStoreSweepDeclinesUnderALiveBuild(t *testing.T) {
 	t.Cleanup(func() { liveBuildFloor = orig })
 	liveBuildFloor = func() (kit.CalVer, bool, int) { return kit.CalVer{}, false, 2 }
 
-	out, err := runStoreSweep("podman", false, 1<<40)
+	out, err := runStoreSweep("podman", false, storeBudget{Bytes: 1 << 40, Source: storeBudgetSourceDefault})
 	if err != nil {
 		t.Fatalf("runStoreSweep: %v", err)
 	}
@@ -571,7 +571,7 @@ func TestStoreCategoryIsUnreachableFromTheWireRequest(t *testing.T) {
 	// An empty request is the shape every peer passes over the wire (plugin-box's post-build
 	// prune, plugin-check's post-run prune): the categories travel as booleans on the SHARED
 	// #RetentionRequest, and `store` has no field there — it cannot be asked for.
-	out := runRetentionOutcome(spec.RetentionRequest{}, cleanPlan{})
+	out := runRetentionOutcome(spec.RetentionRequest{}, cleanPlan{}, storeBudget{})
 	if out.Store != nil {
 		t.Fatalf("a wire request reached the store category: %+v", out.Store)
 	}

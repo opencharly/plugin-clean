@@ -32,8 +32,12 @@ post-run prune) reach the engine over `verb:retention`.
 - **`--store`** — `D-STORE-7`: keep the charly image store's entries that the host's charly state
   still references (the container engine's containers and the quadlet units), evict the rest, free
   the blobs no surviving entry reaches, and report the retained size against the AUTHORED budget
-  (`schema/clean.cue` `store_budget`). It REFUSES — evicting nothing — when a state surface cannot
-  be read, because an unreadable surface is not an empty one. Strictly opt-in.
+  — the ceiling comes from the MACHINE, authored in the user configuration
+  (`~/.config/charly/charly.yml`: `clean: {store_budget: {bytes: …}}`), with the plugin's
+  `schema/clean.cue` 32 GiB as the fallback, and the report names which applied. It REFUSES —
+  evicting nothing — when a state surface cannot be read, or when the configuration is unreadable,
+  because an unreadable surface is not an empty one. Strictly opt-in, and compiled-in only (the
+  configuration is read over the reverse channel).
 - **`--scopes`** — reap HUNG transient build scopes: the systemd user scopes
   buildah/podman put a build container into (`runc-buildah-*.scope`). A scope is
   stopped only when it has been active for at least an hour AND no

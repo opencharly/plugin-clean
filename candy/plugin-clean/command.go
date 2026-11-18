@@ -138,11 +138,26 @@ func runCleanCLI(ctx context.Context, exec *sdk.Executor, args []string) error {
 			return derr
 		}
 	}
+	// The store ceiling is the MACHINE's (`~/.config/charly/charly.yml`), not the project's, so it is
+	// resolved from the per-host configuration and only when the category that uses it was named:
+	// an unreadable configuration is a refusal (see store_budget.go), never a silent 32 GiB.
+	var budget storeBudget
+	if plan.store {
+		authored, hasAuthored, berr := userStoreBudget(ctx, exec, dir)
+		if berr != nil {
+			return berr
+		}
+		var eerr error
+		budget, eerr = effectiveStoreBudget(authored, hasAuthored)
+		if eerr != nil {
+			return eerr
+		}
+	}
 	if plan.any() {
 		out := runRetentionOutcome(spec.RetentionRequest{
 			Dir: dir, DryRun: f.dryRun, Images: plan.images, Check: plan.check, Deep: plan.deep, Cache: plan.cache,
 			Keep: f.keep, KeepImages: keepImages, KeepCheckRuns: keepCheck,
-		}, plan)
+		}, plan, budget)
 		if out.Reply.Error != "" {
 			return fmt.Errorf("%s", out.Reply.Error)
 		}
@@ -289,8 +304,10 @@ func storeLines(o *storeSweepOutcome) []string {
 		lines = append(lines, fmt.Sprintf("store state %s: %s (%s)\n", s.Name, carried, s.Where))
 	}
 	if len(o.Decisions) == 0 {
+		// An empty store still HAS a ceiling, and a reader must be able to see which one applied —
+		// "no entries" is not a reason to hide the provenance the rest of this report carries.
 		lines = append(lines, fmt.Sprintf("store %s: no entries\n", o.Dir))
-		return lines
+		return appendBudgetLines(lines, o)
 	}
 	kept, evicted := o.kept(), o.evicted()
 	verb := "evicted"
@@ -310,17 +327,23 @@ func storeLines(o *storeSweepOutcome) []string {
 			"  (%d planned eviction(s) found the entry already gone — a concurrent writer got there first)\n",
 			o.AlreadyGone))
 	}
+	return appendBudgetLines(lines, o)
+}
+
+// appendBudgetLines is the ONE place the ceiling and its provenance are rendered, so an empty store
+// and a swept one cannot disagree about which number the sweep measured against.
+func appendBudgetLines(lines []string, o *storeSweepOutcome) []string {
 	if o.DryRun {
 		lines = append(lines, fmt.Sprintf(
-			"store budget: %s held of %s — the real run measures what the evicted entries leave behind\n",
-			kit.HumanBytes(o.Held), kit.HumanBytes(o.Budget)))
+			"store budget: %s held of %s — the real run measures what the evicted entries leave behind (ceiling: %s)\n",
+			kit.HumanBytes(o.Held), kit.HumanBytes(o.Budget), o.BudgetSource))
 		lines = append(lines, fmt.Sprintf(
 			"store reclaim: would free %s of already-unreferenced blob(s), and each evicted entry's own layers with them\n",
 			kit.HumanBytes(o.Reclaim)))
 		return lines
 	}
-	lines = append(lines, fmt.Sprintf("store budget: retained %s of %s (%s)\n",
-		kit.HumanBytes(o.Retained), kit.HumanBytes(o.Budget), budgetVerdict(o.Retained, o.Budget)))
+	lines = append(lines, fmt.Sprintf("store budget: retained %s of %s (%s; ceiling: %s)\n",
+		kit.HumanBytes(o.Retained), kit.HumanBytes(o.Budget), budgetVerdict(o.Retained, o.Budget), o.BudgetSource))
 	lines = append(lines, fmt.Sprintf("store reclaim: freed %s of blobs no surviving entry reaches\n", kit.HumanBytes(o.Reclaim)))
 	return lines
 }
