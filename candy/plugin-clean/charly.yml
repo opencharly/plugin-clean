@@ -149,6 +149,20 @@ plugin-clean:
             over-budget store is REPORTED, because the only entries left are the ones state
             references. It never fires on a bare `charly clean`, and a live build makes it DECLINE.
 
+            The `--cache` category also disposes of the store roots the migration record retires, and one
+            of them is an INGEST rather than a removal (opencharly/plugin-clean#30): when sdk#556 moved
+            the image store out of W3.6's data root ($XDG_DATA_HOME/charly/images) it moved the reader
+            and the writer and left the CONTENT behind — hundreds of GiB at a path nothing resolved.
+            That tree is re-published entry by entry into the cache root's `registry` store (blobs
+            hardlinked where the trees share a filesystem, copied otherwise, reported either way), each
+            descriptor re-keyed into the current entry shape, every entry and every reference VERIFIED
+            before the source is removed, and `--store` then applies D-STORE-7 to the result. There is
+            no keep set, so no state surface can make it unsafe; the refusals are about the bytes it
+            moves and each names itself. The pre-relocation path is a recorded legacy fact, not a root:
+            D-STORE-1 (DESIGN.md:2482) declares four roots and data is not one (spec#375 reverted
+            RootData), so the path is spelled once in the retirement record and expanded by one
+            function that resolves no store.
+
             The `--cache` category's routing was fixed in the same change (opencharly/plugin-clean#27):
             the sweep used to run in two halves and SKIP the storekit half whenever the two store
             roots coincided — which `CHARLY_CACHE_DIR` makes them, so on the very hosts that isolate
@@ -213,6 +227,11 @@ plugin-clean:
                 printf 'blob' > "$root/buildkitd.broken-1/blob"
                 CHARLY_CACHE_DIR="$root" charly clean --build-cache --dry-run
                 test -f "$root/buildkitd.broken-1/blob"
+            - check: the cache category ships the legacy data-root disposition — the retirement row, the ingest that verifies before it removes, and the refusals
+              id: clean-legacy-data-root-present
+              context:
+                - build
+              command: "grep -q 'retiredInLegacyDataRoot' retention.go && grep -q 'ingestLegacyImageStore' legacy_store.go && grep -q 'materializeLegacyBlobs' legacy_store.go && grep -q 'NOT removed' legacy_store.go"
             - check: the store category ships D-STORE-7's decision surface — the state inventory, the entry plan, the store-identity router that keeps an image store out of the image-blind reader, the refusal, and the AUTHORED size budget it measures against
               id: clean-store-category-present
               context:

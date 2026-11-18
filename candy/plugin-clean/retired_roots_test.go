@@ -23,6 +23,9 @@ func retiredRootFixture(t *testing.T) (cacheRoot, imagesDir string) {
 	root := t.TempDir()
 	t.Setenv("CHARLY_CACHE_DIR", root)
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	// The record also carries a LEGACY DATA-ROOT row (opencharly/plugin-clean#30). Isolate it, so this
+	// arm exercises its own root and never the operator's `$XDG_DATA_HOME/charly/images`.
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	images := filepath.Join(root, "images", "sha256")
 	if err := os.MkdirAll(images, 0o755); err != nil {
 		t.Fatalf("mkdir retired root: %v", err)
@@ -45,8 +48,11 @@ func TestRetiredCacheRootSweepReportsThenRemoves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweepRetiredCacheRoots(dry): %v", err)
 	}
-	if len(dry) != 1 || dry[0].Name != "images" {
-		t.Fatalf("the record must yield exactly the declared root, got %+v", dry)
+	if len(dry) != 2 || dry[0].Name != "images" || dry[1].Name != "data-images" {
+		t.Fatalf("the record must yield its two declared roots (the cache-root blob store and the legacy data-root image store), got %+v", dry)
+	}
+	if dry[1].Present {
+		t.Fatalf("the legacy data-root row is present in an isolated XDG_DATA_HOME: %+v", dry[1])
 	}
 	if !dry[0].Present || dry[0].Removed {
 		t.Fatalf("dry run = %+v, want present and NOT removed", dry[0])

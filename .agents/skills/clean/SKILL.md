@@ -209,6 +209,28 @@ between the two would free bytes an in-flight entry has not indexed yet.
 whose disk was built from a container image is the one place a store artifact is needed without any
 host record naming it (opencharly/plugin-vm#98 carries that gap).
 
+## The retired roots — and the pre-relocation image store
+
+`--cache` also disposes of the store roots the migration RECORD retires. One of them is not a cache
+entry at all: when `opencharly/sdk#556` moved the image store out of W3.6's data root
+(`$XDG_DATA_HOME/charly/images`) into the cache root's `registry` store, it moved the reader and the
+writer and left the CONTENT behind — hundreds of GiB on a host with build history, at a path nothing
+resolved any more (opencharly/plugin-clean#30).
+
+That root is **ingested, never removed**: every entry is re-published into `registry` (its blobs
+hardlinked where the trees share a filesystem, copied otherwise — reported either way; its descriptor
+re-keyed into the current entry shape), every entry and every reference is VERIFIED in the
+destination, and only then is the source tree removed. There is no keep set, so no state surface can
+make it unsafe; the refusal points are the bytes it moves (an unreadable index, an entry with no
+reference, a manifest the tree does not hold) and each names itself. `charly clean --store` then
+applies D-STORE-7 to the ingested content: it keeps what state references and evicts the rest within
+the authored budget.
+
+There is no data-root RESOLVER, and this does not add one: `D-STORE-1` (`DESIGN.md:2482`) declares
+four roots and data is not among them (`spec/storeroot`'s `RootData` was reverted, spec#375), so the
+pre-relocation path is a RECORDED FACT in the retirement record — spelled once, expanded by one
+function that resolves no store and feeds no reader.
+
 ## The `--cache` category's routing — one reader per store, chosen by IDENTITY
 
 `--cache` sweeps every named store's unreferenced blobs. It used to run in two halves — `spec/cache`

@@ -21,7 +21,11 @@ post-run prune) reach the engine over `verb:retention`.
 - **default** — the charly-labeled dangling-image sweep.
 - **`--images`** — prune images by the retention policy (`keep_images`).
 - **`--check`** — prune `.check` runs (`keep_check_runs`).
-- **`--cache`** — the CAS `ArtifactStore` GC. The reader for each store is chosen from the
+- **`--cache`** — the CAS `ArtifactStore` GC, and the disposition of the two RETIRED store roots
+  (`.local/share/charly/images` and `<cache>/images`). The legacy **data-root** image store is
+  **ingested** into `<cache>/registry` — every entry, verified, before the source tree is removed —
+  never deleted, because it holds built images; `--store` then applies D-STORE-7's reference policy
+  to the result. The reader for each store is chosen from the
   store's OWN index (storekit entry manifests → storekit, OCI image manifests → `spec/cache`), never
   from the root it sits under: the image store must never be swept by the image-blind reader
   (opencharly/plugin-clean#27), and a store that cannot be classified is refused and reported.

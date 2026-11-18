@@ -291,10 +291,52 @@ func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan) retentionOut
 // `oci-layout` files, so the discovery mechanism correctly finds nothing there. Deciding that such
 // a root is retired is POLICY, and policy belongs in a declared record, not in a widened predicate
 // (a predicate that swallowed retired roots would be policy wearing a mechanism's name).
+// retiredRootPlace says WHERE a retired root lived, which decides both how its path is resolved and
+// what disposing of it MEANS.
+type retiredRootPlace int
+
+const (
+	// retiredInCacheRoot — a single path element under the ONE cache root (`storekit.StoreDir`, which
+	// validates the element so a root can never escape the root). Disposal is a whole-tree removal:
+	// this tree is a blob store nothing reads.
+	retiredInCacheRoot retiredRootPlace = iota
+	// retiredInLegacyDataRoot — a path a PREVIOUS version wrote under `$XDG_DATA_HOME/charly`, which the
+	// contract no longer has a root for. Disposal is an INGEST, never a removal: it holds built images.
+	retiredInLegacyDataRoot
+)
+
+// legacyDataRoot resolves `$XDG_DATA_HOME` (else `$HOME/.local/share`) — the PRE-RELOCATION data root,
+// which the contract no longer declares.
+//
+// ⚑ THIS IS NOT A ROOT RESOLVER, AND IT MUST NOT BECOME ONE. `D-STORE-1` (DESIGN.md:2482) declares
+// four roots — config, cache, state, runtime — and DATA IS NOT ONE OF THEM; `spec/storeroot`'s
+// `RootData` was reverted as contrary to that row (opencharly/spec#375), so asking it to name this
+// path would be asking it to re-introduce a root the contract removed. What remains is a FACT about
+// a version that is gone: an old charly wrote its image store under `$XDG_DATA_HOME/charly/images`.
+// Recording where a previous version put something is exactly what the retirement record below is
+// for, and this function is the ONE place that fact is expanded — it resolves no store, feeds no
+// reader, and is called by the retirement sweep and by nothing else.
+func legacyDataRoot() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); v != "" {
+		return v, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving the pre-relocation data root: %w", err)
+	}
+	return filepath.Join(home, ".local", "share"), nil
+}
+
 type retiredCacheRoot struct {
-	// Name is the single path element under the cache root (validated by storekit.StoreDir, so it
-	// can never escape the root).
+	// Name labels the root in the report.
 	Name string
+	// Place is WHERE the root lived. It is a field rather than an assumption because one of the
+	// retired roots is not under the cache root at all (see retiredInLegacyDataRoot).
+	Place retiredRootPlace
+	// Elems are the path ELEMENTS under the resolved root. A cache-root row has exactly one (the
+	// store name, which `storekit.StoreDir` validates so a root cannot escape the cache root); a
+	// legacy data-root row spells the elements the old version wrote.
+	Elems []string
 	// Reason is why this root is retired: what wrote it and what replaced it.
 	Reason string
 	// Migration is where the content went, so a reader of the report can re-fetch rather than
@@ -307,24 +349,64 @@ type retiredCacheRoot struct {
 // nothing in the mechanism has to learn a new shape.
 func retiredCacheRoots() []retiredCacheRoot {
 	return []retiredCacheRoot{{
-		Name: "images",
+		Name:  "images",
+		Place: retiredInCacheRoot,
+		Elems: []string{"images"},
 		Reason: "the pre-rename image blob store (`<cache>/images/sha256/<hex>`), retired when `charly images` " +
 			"became `charly registry`; superseded by the shared named store, which keys content by the full ref",
 		Migration: "re-ingest with `charly cache ingest <ref>` (opencharly/plugin-cache); the content lands in the " +
 			"shared named store `<cache root>/registry`",
+	}, {
+		Name:  "data-images",
+		Place: retiredInLegacyDataRoot,
+		Elems: []string{"charly", "images"},
+		Reason: "the IMAGE store at the pre-relocation DATA root (`$XDG_DATA_HOME/charly/images`), abandoned " +
+			"when opencharly/sdk#556 moved the image store into the ONE cache root as the `registry` named " +
+			"store. Nothing resolves that path any more — `storekit.StoreDir`/`NamedStores` are cache-root-only " +
+			"— so on a host with build history it held hundreds of GiB that no charly verb could name, report " +
+			"or reclaim (opencharly/plugin-clean#30)",
+		Migration: "INGESTED into `<cache root>/registry` by THIS category — every entry, verified, before the " +
+			"source tree is removed — so nothing is lost, and the retained set becomes policy-addressable by " +
+			"`charly clean --store`, which keeps what state references and evicts the rest (D-STORE-7)",
 	}}
 }
 
 // retiredRootOutcome is ONE retired root's report line: where it is, how much a removal reclaimed or
 // would reclaim, and whether the sweep removed it (never under --dry-run).
 type retiredRootOutcome struct {
-	Name      string
-	Dir       string
-	Bytes     int64
-	Present   bool
-	Removed   bool
+	Name    string
+	Dir     string
+	Bytes   int64
+	Present bool
+	Removed bool
+	// Entries is the number of image entries the legacy index named (0 for a blob store).
+	Entries int
+	// Ingested records that the tree's content was published into the registry store.
+	Ingested bool
+	// IngestDest is where an ingest published the content (empty for a blob-store row).
+	IngestDest string
+	// Linked records that the ingest SHARED its bytes with the destination (a hardlink) rather than
+	// copying them — a figure an operator needs, because a copy is temporary extra disk.
+	Linked    bool
 	Reason    string
 	Migration string
+}
+
+// retiredRootDir resolves ONE retired root's directory through its PLACE: a cache-root row through
+// `storekit.StoreDir` (the ONE cache-root resolver, which validates the element), a legacy data-root
+// row through `legacyDataRoot` (a recorded fact about a dead version, not a live root — see its doc).
+func retiredRootDir(root retiredCacheRoot) (string, error) {
+	if root.Place == retiredInLegacyDataRoot {
+		base, err := legacyDataRoot()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(append([]string{base}, root.Elems...)...), nil
+	}
+	if len(root.Elems) != 1 {
+		return "", fmt.Errorf("a cache-root row names exactly one path element, got %v", root.Elems)
+	}
+	return storekit.StoreDir(root.Elems[0])
 }
 
 // sweepRetiredCacheRoots applies the retirement record with the same report-then-remove idiom the
@@ -339,7 +421,7 @@ type retiredRootOutcome struct {
 func sweepRetiredCacheRoots(dryRun bool) ([]retiredRootOutcome, error) {
 	out := make([]retiredRootOutcome, 0, len(retiredCacheRoots()))
 	for _, root := range retiredCacheRoots() {
-		dir, err := storekit.StoreDir(root.Name)
+		dir, err := retiredRootDir(root)
 		if err != nil {
 			return nil, fmt.Errorf("retired cache root %q: %w", root.Name, err)
 		}
@@ -354,6 +436,20 @@ func sweepRetiredCacheRoots(dryRun bool) ([]retiredRootOutcome, error) {
 			continue
 		}
 		entry.Present = true
+		if root.Place == retiredInLegacyDataRoot {
+			// It holds built images: INGEST, never remove. A failure here leaves the tree EXACTLY as
+			// it was — the ingest verifies before it deletes — and is reported by name.
+			dstDir, derr := storekit.ImageStoreDir()
+			if derr != nil {
+				return nil, fmt.Errorf("retired %s: resolving the destination image store: %w", root.Name, derr)
+			}
+			entry.IngestDest = dstDir
+			if ierr := ingestLegacyImageStore(dir, dstDir, dryRun, &entry); ierr != nil {
+				return nil, fmt.Errorf("retired %s at %s: %w", root.Name, dir, ierr)
+			}
+			out = append(out, entry)
+			continue
+		}
 		entry.Bytes = treeBytes(dir)
 		if !dryRun {
 			if rerr := os.RemoveAll(dir); rerr != nil {
