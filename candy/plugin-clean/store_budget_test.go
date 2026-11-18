@@ -207,7 +207,7 @@ func TestStoreBudgetSurvivesTheInt64Projection(t *testing.T) {
 	authored := int64(274877906944) // a VARIABLE: an int32 conversion of a constant is an overflow error
 	got, has, err := budgetFromCleanSection(decodeUserConfig(t, "clean:\n  store_budget:\n    bytes: 274877906944\n").Clean)
 	if err != nil || !has || got != authored {
-		t.Fatalf("budgetFromDeployConfig = (%d, %v, %v), want (%d, true, nil)", got, has, err, authored)
+		t.Fatalf("budgetFromCleanSection = (%d, %v, %v), want (%d, true, nil)", got, has, err, authored)
 	}
 	//nolint:gosec // deliberate: the assertion is that a 32-bit int CANNOT carry this value.
 	narrowed := int32(got)

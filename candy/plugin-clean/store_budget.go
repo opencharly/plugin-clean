@@ -85,7 +85,7 @@ func loadUserStoreBudget(ctx context.Context, exec *sdk.Executor) (int64, bool, 
 	return budgetFromCleanSection(clean)
 }
 
-// budgetFromDeployConfig is the DECISION, split out from the read so every level of "unset" can be
+// budgetFromCleanSection is the DECISION, split out from the read so every level of "unset" can be
 // asserted on the real spec types instead of through a test double: the four levels are
 //
 //	clean == nil                  -> no configuration, or no clean: block ((0, false, nil))
