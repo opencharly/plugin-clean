@@ -230,12 +230,17 @@ func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retention
 				// A legacy IMAGE store is INGESTED, never removed: the report says what moved, where,
 				// and whether the bytes were shared or copied. Under --dry-run it says what WOULD move
 				// and that the source is untouched until the ingest verifies.
-				verb, how, tail := "would ingest", "hardlinked", "the source tree stays until the ingest verifies"
+				// A dry run cannot know whether the destination shares a filesystem with the source, so
+				// it says both cases rather than asserting "copied" (the zero value of Linked) — a
+				// figure that looked like a measurement while being an unset field is the class of
+				// report this category exists to avoid.
+				verb, how, tail := "would ingest", "hardlinked where the two trees share a filesystem, copied otherwise", "the source tree stays until the ingest verifies"
 				if r.Ingested {
 					verb, tail = "ingested", "removed the source tree"
-				}
-				if !r.Linked {
 					how = "copied"
+					if r.Linked {
+						how = "hardlinked"
+					}
 				}
 				lines = append(lines, fmt.Sprintf("cache retired %s: %s %d entry(ies) (%s) from %s into %s (%s); %s\n",
 					r.Name, verb, r.Entries, kit.HumanBytes(r.Bytes), r.Dir, r.IngestDest, how, tail))
