@@ -17,7 +17,6 @@ import (
 	"testing"
 
 	"github.com/opencharly/sdk/storekit"
-	"github.com/opencharly/spec/spec"
 )
 
 // legacyFixture builds the pre-relocation image store the way W3.6's writer did: an OCI layout whose
@@ -312,16 +311,19 @@ func TestRetiredRootLegacyIngestRefusesAnEntryItCannotName(t *testing.T) {
 // function. A second appearance anywhere in the package would be a second copy of a path the
 // contract has no root for.
 func TestRetiredRootLegacyRowIsTheOnlyPlaceTheDataPathAppears(t *testing.T) {
-	cacheRoot, dataRoot := legacyRoots(t)
-	if dir, err := retiredRootDir(retiredCacheRoot{Name: "data-images", Place: retiredInLegacyDataRoot, Elems: []string{"charly", "images"}}); err != nil {
+	_, dataRoot := legacyRoots(t)
+	dir, err := retiredRootDir(retiredCacheRoot{Place: retiredInLegacyDataRoot, Elems: []string{"charly", "images"}})
+	if err != nil {
 		t.Fatalf("retiredRootDir: %v", err)
-	} else if want := filepath.Join(dataRoot, "charly", "images"); dir != want {
+	}
+	if want := filepath.Join(dataRoot, "charly", "images"); dir != want {
 		t.Fatalf("retiredRootDir = %q, want %q", dir, want)
 	}
-	if _, err := retiredRootDir(retiredCacheRoot{Name: "images", Place: retiredInCacheRoot, Elems: []string{"images"}}); err != nil {
+	// The cache-root row still resolves through the ONE cache-root resolver.
+	if dir, err := retiredRootDir(retiredCacheRoot{Place: retiredInCacheRoot, Elems: []string{"images"}}); err != nil {
 		t.Fatalf("cache-root row: %v", err)
-	} else {
-		_ = cacheRoot
+	} else if want := filepath.Join(os.Getenv("CHARLY_CACHE_DIR"), "images"); dir != want {
+		t.Fatalf("cache-root dir = %q, want %q", dir, want)
 	}
 	// The record declares the elements; the resolver expands them. Nothing in Go spells out the
 	// absolute data path.
@@ -330,5 +332,4 @@ func TestRetiredRootLegacyRowIsTheOnlyPlaceTheDataPathAppears(t *testing.T) {
 			t.Fatalf("legacy row carries %v, want the two elements the old version wrote", r.Elems)
 		}
 	}
-	_ = spec.RetentionRequest{}
 }
