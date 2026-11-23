@@ -11,7 +11,7 @@ import (
 
 // namedSet builds the map cleanCategories resolves from the category flags, so a case reads as the
 // flags an operator typed rather than as a positional tuple.
-func namedSet(images, check, deep, cacheGC, scopes, buildCache, store bool) map[string]bool {
+func namedSet(images, check, deep, cacheGC, scopes, buildCache, store, exports bool) map[string]bool {
 	out := map[string]bool{}
 	for word, on := range map[string]bool{
 		"images":      images,
@@ -21,6 +21,7 @@ func namedSet(images, check, deep, cacheGC, scopes, buildCache, store bool) map[
 		"scopes":      scopes,
 		"build-cache": buildCache,
 		"store":       store,
+		"exports":     exports,
 	} {
 		if on {
 			out[word] = true
@@ -48,10 +49,11 @@ func TestCleanCategories(t *testing.T) {
 		name                         string
 		images, check, deep, cacheGC bool
 		scopes, buildCache, store    bool
+		exports                      bool
 		want                         cleanPlan
 	}{
-		{name: "no flags: full default sweep, scopes included, deep, store and build-cache excluded",
-			want: cleanPlan{images: true, check: true, scopes: true}},
+		{name: "no flags: full default sweep, scopes and exports included, deep, store and build-cache excluded",
+			want: cleanPlan{images: true, check: true, scopes: true, exports: true}},
 		{name: "--images alone: only images, no scopes",
 			images: true,
 			want:   cleanPlan{images: true}},
@@ -100,16 +102,22 @@ func TestCleanCategories(t *testing.T) {
 		{name: "--store + --images: both, check excluded, and no default leaks in",
 			images: true, store: true,
 			want: cleanPlan{images: true, store: true}},
+		{name: "--exports alone: ONLY exports — naming it suppresses the default set",
+			exports: true,
+			want:    cleanPlan{exports: true}},
+		{name: "--exports + --images: both, and no default category leaks in",
+			images: true, exports: true,
+			want: cleanPlan{images: true, exports: true}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := cleanCategories(namedSet(c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, c.store))
+			got, err := cleanCategories(namedSet(c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, c.store, c.exports))
 			if err != nil {
 				t.Fatalf("cleanCategories: %v", err)
 			}
 			if got != c.want {
-				t.Errorf("cleanCategories(images=%v,check=%v,deep=%v,cache=%v,scopes=%v,build-cache=%v,store=%v) = %+v, want %+v",
-					c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, c.store, got, c.want)
+				t.Errorf("cleanCategories(images=%v,check=%v,deep=%v,cache=%v,scopes=%v,build-cache=%v,store=%v,exports=%v) = %+v, want %+v",
+					c.images, c.check, c.deep, c.cacheGC, c.scopes, c.buildCache, c.store, c.exports, got, c.want)
 			}
 		})
 	}
@@ -177,11 +185,12 @@ func TestCleanCategoriesParseTheFullGrammar(t *testing.T) {
 		args []string
 		want cleanPlan
 	}{
-		{args: nil, want: cleanPlan{images: true, check: true, scopes: true}},
+		{args: nil, want: cleanPlan{images: true, check: true, scopes: true, exports: true}},
 		{args: []string{"--build-cache"}, want: cleanPlan{buildCache: true}},
 		{args: []string{"--build-cache", "--dry-run"}, want: cleanPlan{buildCache: true}},
 		{args: []string{"--deep", "--dry-run", "--keep", "1"}, want: cleanPlan{deep: true, scopes: true}},
 		{args: []string{"--store", "--dry-run"}, want: cleanPlan{store: true}},
+		{args: []string{"--exports"}, want: cleanPlan{exports: true}},
 	}
 	for _, c := range cases {
 		var f cleanFlags

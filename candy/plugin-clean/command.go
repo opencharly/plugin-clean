@@ -267,6 +267,9 @@ func printRetentionResult(w io.Writer, tag string, plan cleanPlan, out retention
 	if plan.buildCache {
 		lines = append(lines, buildCacheLines(tag, out.BuildCache)...)
 	}
+	if plan.exports && out.Exports != nil {
+		lines = append(lines, exportLines(tag, out.Exports)...)
+	}
 	if _, err := fmt.Fprint(w, strings.Join(lines, "")); err != nil {
 		return fmt.Errorf("printing the clean report: %w", err)
 	}
@@ -465,4 +468,17 @@ func resolveRetentionDefaults(ctx context.Context, exec *sdk.Executor, dir strin
 	}
 	keepImages, keepCheck = loaderkit.ResolveRetentionDefaultsViaExecutor(ctx, exec, dir)
 	return keepImages, keepCheck, nil
+}
+
+// exportLines renders the `exports` category: the live-build guard's decision IN PLACE OF the
+// count (never beside it — an empty list and a declined sweep must not read alike), the archives a
+// process holds open, and the removals themselves.
+func exportLines(tag string, o *exportSweepOutcome) []string {
+	lines := sweepLines("exports", o.Skip,
+		fmt.Sprintf("%s %d intermediate export archive(s) in %s (%s)",
+			tag, len(o.Removed), o.Dir, kit.HumanBytes(o.Bytes)), o.Removed)
+	for _, p := range o.Held {
+		lines = append(lines, fmt.Sprintf("exports held: %s (a process holds it open; left alone)\n", p))
+	}
+	return lines
 }

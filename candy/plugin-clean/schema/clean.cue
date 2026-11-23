@@ -127,6 +127,13 @@
 			contract: "Reclaim the builder's persistent cache — the BuildKit daemon's StateRoot() at <cache root>/buildkitd and every quarantined sibling (buildkitd.broken-*). The live root is removed only when no daemon holds its one-instance lock (a running daemon is named and the root is left alone), and a tree this user cannot delete whole is reported by name and left whole. Never fires on a bare run"
 			bare: false
 		},
+		{
+			flag: "exports"
+			// The flag package treats a backtick in help text as the VALUE NAME (see the
+			// build-cache row above), so the archive's own filename shape is named in prose.
+			contract: "Remove the builder's intermediate OCI export archives — one per image build, deleted when its bridge into the run engine completes, so only a failed or crashed build leaves one. Declines while any build is live and names any archive a process holds open; runs on a bare run"
+			bare: true
+		},
 	]
 }
 

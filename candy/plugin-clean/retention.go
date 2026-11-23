@@ -125,6 +125,12 @@ type retentionOutcome struct {
 	// clean`'s own CLI reaches — no peer asks for it over verb:retention, and it needs neither the
 	// resolved keep-defaults nor the container engine (see runRetentionOutcome's needsEngine).
 	BuildCache []buildCacheRootOutcome
+
+	// Exports is the `exports` category: the builder's leftover intermediate OCI export archives.
+	// It rides HERE, not on spec.RetentionReply, for the same reason the scopes and build-cache
+	// do: only `charly clean`'s own CLI reaches it, and it needs neither the resolved
+	// keep-defaults nor the container engine (see needsEngine below).
+	Exports *exportSweepOutcome
 }
 
 // runRetentionOutcome runs the requested category(ies) and returns the wire reply plus the
@@ -281,6 +287,13 @@ func runRetentionOutcome(req spec.RetentionRequest, plan cleanPlan, budget store
 			return retentionOutcome{Reply: spec.RetentionReply{Error: fmt.Sprintf("sweeping the builder's cache: %v", berr)}}
 		}
 		out.BuildCache = roots
+	}
+	if plan.exports {
+		exports, xerr := sweepExports(req.DryRun)
+		if xerr != nil {
+			return retentionOutcome{Reply: spec.RetentionReply{Error: xerr.Error()}}
+		}
+		out.Exports = &exports
 	}
 	return out
 }
