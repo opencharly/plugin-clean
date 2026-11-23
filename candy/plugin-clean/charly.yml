@@ -4,8 +4,11 @@ plugin-clean:
             COMPILED-IN charly COMMAND-class plugin that OWNS the externalized `charly clean`
             CLI — the build-artifact retention/prune surface. The plugin owns the command end to
             end: the flag grammar (--dry-run / --images / --check / --deep / --cache / --scopes /
-            --build-cache / --store / --keep / --invalidate), the category orchestration, and the
-            report output.
+            --build-cache / --exports / --store / --keep / --invalidate), the category orchestration,
+            and the report output. --exports removes the builder's INTERMEDIATE OCI export archives
+            (one per build, deleted when its bridge completes; only a failed or crashed build leaves
+            one — opencharly/plugin-build#64), guarded by the live-build floor AND an open-handle
+            scan, because the lock alone was measured empty while a build was mid-resolve.
             No plugin-specific command LOGIC is left in core.
 
             The CATEGORY SET is declared once, in schema/clean.cue (`#CleanPlugin.categories`), and the
@@ -279,4 +282,4 @@ clean-skill:
     family: core
     owner: plugin-clean
     triggers:
-      - "`charly clean` / build-artifact retention / `keep_images` / `keep_check_runs` / image-tag pruning / `.check` run cleanup"
+      - "`charly clean` / build-artifact retention / `keep_images` / `keep_check_runs` / image-tag pruning / `.check` run cleanup / leftover OCI export archives in the builder's state root"

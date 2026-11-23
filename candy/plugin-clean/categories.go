@@ -179,12 +179,13 @@ type cleanPlan struct {
 	scopes     bool
 	buildCache bool
 	store      bool
+	exports    bool
 }
 
 // any reports whether the plan runs at least one category — the guard that decides whether the
 // engine is entered at all.
 func (p cleanPlan) any() bool {
-	return p.images || p.check || p.deep || p.cache || p.scopes || p.buildCache || p.store
+	return p.images || p.check || p.deep || p.cache || p.scopes || p.buildCache || p.store || p.exports
 }
 
 // categoryPlanFields binds each DECLARED category flag to the cleanPlan field that carries it. It
@@ -199,6 +200,7 @@ var categoryPlanFields = map[string]func(*cleanPlan) *bool{
 	"scopes":      func(p *cleanPlan) *bool { return &p.scopes },
 	"build-cache": func(p *cleanPlan) *bool { return &p.buildCache },
 	"store":       func(p *cleanPlan) *bool { return &p.store },
+	"exports":     func(p *cleanPlan) *bool { return &p.exports },
 }
 
 // cleanCategories resolves the category flags the operator NAMED into the set this invocation
